@@ -131,6 +131,20 @@ func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParame
 		}
 	}
 
+	// Convert anyOf patterns like {"anyOf": [{"type":"string"},{"type":"null"}]} to {"type":"string"}
+	// This is needed for Gemini via Cloudflare which doesn't support anyOf in tool parameters.
+	if anyOf, ok := schema["anyOf"].([]any); ok {
+		for _, item := range anyOf {
+			if itemMap, ok := item.(map[string]any); ok {
+				if typStr, ok := itemMap["type"].(string); ok && typStr != "null" {
+					schema["type"] = typStr
+					delete(schema, "anyOf")
+					break
+				}
+			}
+		}
+	}
+
 	// Recursively handle properties
 	if propertiesValue, ok := schema["properties"]; ok {
 		if properties, ok := propertiesValue.(map[string]any); ok {
