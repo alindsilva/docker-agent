@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -62,12 +63,19 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			// Not a custom provider - use default OpenAI behavior (OPENAI_API_KEY from env)
 			// The OpenAI SDK will automatically look for OPENAI_API_KEY if no key is set
 		} else {
-			// Custom provider without token_key - don't set any API key
-			// This avoids sending an empty Authorization header which some gateways reject
-			slog.Debug("Custom provider with no token_key, sending requests without authentication",
+			// Custom provider without token_key - prevent SDK from using OPENAI_API_KEY env var
+			// We need to explicitly set the API key to prevent the SDK from reading OPENAI_API_KEY
+			// but we don't want to send an Authorization header. The SDK doesn't send the header
+			// if we use option.WithAPIKey with a specific marker value and then remove it via middleware.
+			slog.Debug("Custom provider with no token_key, disabling OpenAI SDK authentication",
 				"provider", cfg.Provider, "base_url", cfg.BaseURL)
-			// Note: We deliberately do NOT call option.WithAPIKey("") here because that
-			// would add an invalid "Authorization: Bearer " header causing 400 errors
+			
+			// Use a custom HTTP client that removes the Authorization header
+			clientOptions = append(clientOptions, option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+				// Remove Authorization header for custom providers without token_key
+				req.Header.Del("Authorization")
+				return next(req)
+			}))
 		}
 
 		if cfg.Provider == "azure" {
