@@ -107,20 +107,28 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		// Apply custom headers from provider config if present
 		if cfg.ProviderOpts != nil {
 			if headersMap, ok := cfg.ProviderOpts["headers"].(map[string]string); ok {
+				slog.Debug("Applying custom headers", "count", len(headersMap), "provider", cfg.Provider)
 				for key, value := range headersMap {
 					// Expand environment variables in header values (e.g., ${VAR_NAME})
 					expandedValue, err := environment.Expand(ctx, value, env)
 					if err != nil {
-						slog.Warn("Failed to expand environment variable in header",
+						slog.Error("Failed to expand environment variable in header",
 							"header", key,
-							"error", err)
-						continue
+							"value", value,
+							"error", err,
+							"provider", cfg.Provider)
+						return nil, fmt.Errorf("expanding header %s: %w", key, err)
 					}
 					clientOptions = append(clientOptions, option.WithHeader(key, expandedValue))
 					slog.Debug("Applied custom header",
 						"header", key,
 						"provider", cfg.Provider)
 				}
+			} else if _, exists := cfg.ProviderOpts["headers"]; exists {
+				slog.Error("Invalid headers configuration - expected map[string]string",
+					"type", fmt.Sprintf("%T", cfg.ProviderOpts["headers"]),
+					"provider", cfg.Provider)
+				return nil, fmt.Errorf("invalid headers configuration: expected map[string]string, got %T", cfg.ProviderOpts["headers"])
 			}
 		}
 
