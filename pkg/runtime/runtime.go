@@ -1306,6 +1306,12 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		}
 		choice := response.Choices[0]
 
+		contentPreview := choice.Delta.Content
+		if len(contentPreview) > 50 {
+			contentPreview = contentPreview[:50] + "..."
+		}
+		slog.Debug("Stream chunk received", "agent", a.Name(), "finish_reason", choice.FinishReason, "has_content", choice.Delta.Content != "", "content_preview", contentPreview, "has_tool_calls", len(choice.Delta.ToolCalls) > 0)
+
 		if len(choice.Delta.ThoughtSignature) > 0 {
 			thoughtSignature = choice.Delta.ThoughtSignature
 		}
@@ -1327,21 +1333,7 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 			}
 		}
 
-		if choice.FinishReason == chat.FinishReasonStop || choice.FinishReason == chat.FinishReasonLength {
-			return streamResult{
-				Calls:             toolCalls,
-				Content:           fullContent.String(),
-				ReasoningContent:  fullReasoningContent.String(),
-				ThinkingSignature: thinkingSignature,
-				ThoughtSignature:  thoughtSignature,
-				Stopped:           true,
-				ActualModel:       actualModel,
-				Usage:             messageUsage,
-				RateLimit:         messageRateLimit,
-			}, nil
-		}
-
-		// Handle tool calls
+		// Handle tool calls BEFORE checking finish reason to capture all tool call deltas
 		if len(choice.Delta.ToolCalls) > 0 {
 			// Process each tool call delta
 			for _, delta := range choice.Delta.ToolCalls {
@@ -1379,9 +1371,9 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 					}
 				}
 			}
-			continue
 		}
 
+		// Handle content deltas BEFORE checking finish reason
 		if choice.Delta.ReasoningContent != "" {
 			events <- AgentChoiceReasoning(a.Name(), choice.Delta.ReasoningContent)
 			fullReasoningContent.WriteString(choice.Delta.ReasoningContent)
@@ -1395,6 +1387,21 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		if choice.Delta.Content != "" {
 			events <- AgentChoice(a.Name(), choice.Delta.Content)
 			fullContent.WriteString(choice.Delta.Content)
+		}
+
+		// Check finish reason AFTER processing content to ensure final chunk content is captured
+		if choice.FinishReason == chat.FinishReasonStop || choice.FinishReason == chat.FinishReasonLength {
+			return streamResult{
+				Calls:             toolCalls,
+				Content:           fullContent.String(),
+				ReasoningContent:  fullReasoningContent.String(),
+				ThinkingSignature: thinkingSignature,
+				ThoughtSignature:  thoughtSignature,
+				Stopped:           true,
+				ActualModel:       actualModel,
+				Usage:             messageUsage,
+				RateLimit:         messageRateLimit,
+			}, nil
 		}
 	}
 
