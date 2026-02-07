@@ -85,6 +85,27 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			clientOptions = append(clientOptions, option.WithBaseURL(cfg.BaseURL))
 		}
 
+
+		// Apply custom headers from provider config if present
+		if cfg.ProviderOpts != nil {
+			if headersMap, ok := cfg.ProviderOpts["headers"].(map[string]string); ok {
+				for key, value := range headersMap {
+					// Expand environment variables in header values (e.g., ${VAR_NAME})
+					expandedValue, err := environment.Expand(ctx, value, env)
+					if err != nil {
+						slog.Warn("Failed to expand environment variable in header",
+							"header", key,
+							"error", err)
+						continue
+					}
+					clientOptions = append(clientOptions, option.WithHeader(key, expandedValue))
+					slog.Debug("Applied custom header",
+						"header", key,
+						"provider", cfg.Provider)
+				}
+			}
+		}
+
 		httpClient := httpclient.NewHTTPClient()
 		clientOptions = append(clientOptions, option.WithHTTPClient(httpClient))
 

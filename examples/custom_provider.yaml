@@ -18,6 +18,15 @@ providers:
     base_url: https://responses.example.com/
     token_key: API_KEY_ENV_VAR_NAME
 
+  # Example: Cloudflare AI Gateway with custom headers
+  cloudflare_gateway:
+    api_type: openai_chatcompletions
+    base_url: https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat
+    token_key: GOOGLE_API_KEY  # Standard Authorization header for provider auth
+    headers:
+      # Custom header for gateway authentication with environment variable expansion
+      cf-aig-authorization: Bearer ${CLOUDFLARE_AI_GATEWAY_TOKEN}
+
 # Define models that use the custom providers
 models:
   # Model using the custom gateway provider
@@ -32,6 +41,13 @@ models:
     provider: responses_provider
     model: gpt-5
     max_tokens: 16000
+
+  # Model using Cloudflare AI Gateway with custom headers
+  gemini_via_cloudflare:
+    provider: cloudflare_gateway
+    model: google-ai-studio/gemini-2.5-flash
+    max_tokens: 8000
+    temperature: 0.7
 
 # Define agents that use the models
 agents:
