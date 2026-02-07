@@ -1405,17 +1405,23 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 
 	// Stream completed (EOF or stopped)
 	slog.Debug("Stream EOF received", "agent", a.Name(), "total_chunks", chunkCount)
-	
+
 	// If the stream completed without producing any content or tool calls, likely because of a token limit, stop to avoid breaking the request loop
 	// NOTE(krissetto): this can likely be removed once compaction works properly with all providers (aka dmr)
 	stoppedDueToNoOutput := fullContent.Len() == 0 && len(toolCalls) == 0
+
+	// When there are tool calls, never mark as stopped - the main loop must continue
+	// to call the model again with tool results so it can generate a text response.
+	// Some providers (e.g. Cloudflare AI Gateway) may send finish_reason="stop" even
+	// when tool calls are present, instead of the expected "tool_calls" finish reason.
+	hasToolCalls := len(toolCalls) > 0
 	return streamResult{
 		Calls:             toolCalls,
 		Content:           fullContent.String(),
 		ReasoningContent:  fullReasoningContent.String(),
 		ThinkingSignature: thinkingSignature,
 		ThoughtSignature:  thoughtSignature,
-		Stopped:           stopped || stoppedDueToNoOutput,
+		Stopped:           !hasToolCalls && (stopped || stoppedDueToNoOutput),
 		ActualModel:       actualModel,
 		Usage:             messageUsage,
 		RateLimit:         messageRateLimit,
