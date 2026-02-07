@@ -1258,6 +1258,7 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 	var actualModelEventEmitted bool
 	var messageUsage *chat.Usage
 	var messageRateLimit *chat.RateLimit
+	var stopped bool
 
 	modelID := getAgentModelID(a)
 	toolCallIndex := make(map[string]int)   // toolCallID -> index in toolCalls slice
@@ -1267,14 +1268,18 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		toolDefMap[t.Name] = t
 	}
 
+	chunkCount := 0
 	for {
 		response, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
+			slog.Debug("Stream EOF received", "agent", a.Name(), "total_chunks", chunkCount)
 			break
 		}
 		if err != nil {
 			return streamResult{Stopped: true}, fmt.Errorf("error receiving from stream: %w", err)
 		}
+		chunkCount++
+		slog.Debug("Stream Recv() called", "agent", a.Name(), "chunk_number", chunkCount)
 
 		if response.Usage != nil {
 			messageUsage = response.Usage
@@ -1390,21 +1395,17 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		}
 
 		// Check finish reason AFTER processing content to ensure final chunk content is captured
+		// Note: Don't return immediately - finish_reason might appear before all content chunks
+		// Continue processing until EOF to capture all streaming content
 		if choice.FinishReason == chat.FinishReasonStop || choice.FinishReason == chat.FinishReasonLength {
-			return streamResult{
-				Calls:             toolCalls,
-				Content:           fullContent.String(),
-				ReasoningContent:  fullReasoningContent.String(),
-				ThinkingSignature: thinkingSignature,
-				ThoughtSignature:  thoughtSignature,
-				Stopped:           true,
-				ActualModel:       actualModel,
-				Usage:             messageUsage,
-				RateLimit:         messageRateLimit,
-			}, nil
+			// Mark as stopped but continue reading remaining chunks
+			stopped = true
 		}
 	}
 
+	// Stream completed (EOF or stopped)
+	slog.Debug("Stream EOF received", "agent", a.Name(), "total_chunks", chunkCount)
+	
 	// If the stream completed without producing any content or tool calls, likely because of a token limit, stop to avoid breaking the request loop
 	// NOTE(krissetto): this can likely be removed once compaction works properly with all providers (aka dmr)
 	stoppedDueToNoOutput := fullContent.Len() == 0 && len(toolCalls) == 0
@@ -1414,7 +1415,7 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		ReasoningContent:  fullReasoningContent.String(),
 		ThinkingSignature: thinkingSignature,
 		ThoughtSignature:  thoughtSignature,
-		Stopped:           stoppedDueToNoOutput,
+		Stopped:           stopped || stoppedDueToNoOutput,
 		ActualModel:       actualModel,
 		Usage:             messageUsage,
 		RateLimit:         messageRateLimit,
