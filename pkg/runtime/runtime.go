@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/openai/openai-go/v3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -1273,6 +1274,14 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 			break
 		}
 		if err != nil {
+			var apiErr *openai.Error
+			if errors.As(err, &apiErr) {
+				slog.Debug("Stream API error details",
+					"agent", a.Name(),
+					"status_code", apiErr.StatusCode,
+					"response_body", string(apiErr.DumpResponse(true)),
+				)
+			}
 			return streamResult{Stopped: true}, fmt.Errorf("error receiving from stream: %w", err)
 		}
 
