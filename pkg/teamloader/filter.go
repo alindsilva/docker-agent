@@ -45,6 +45,24 @@ type filterTools struct {
 // Verify interface compliance
 var _ tools.Instructable = (*filterTools)(nil)
 
+// Start forwards the Start call to the inner toolset if it implements Startable.
+// This is necessary because filterTools wraps toolsets (like MCP) that require
+// initialization before their Tools() method can be called.
+func (f *filterTools) Start(ctx context.Context) error {
+	if startable, ok := f.ToolSet.(tools.Startable); ok {
+		return startable.Start(ctx)
+	}
+	return nil
+}
+
+// Stop forwards the Stop call to the inner toolset if it implements Startable.
+func (f *filterTools) Stop(ctx context.Context) error {
+	if startable, ok := f.ToolSet.(tools.Startable); ok {
+		return startable.Stop(ctx)
+	}
+	return nil
+}
+
 // Instructions implements tools.Instructable by delegating to the inner toolset.
 func (f *filterTools) Instructions() string {
 	return tools.GetInstructions(f.ToolSet)
