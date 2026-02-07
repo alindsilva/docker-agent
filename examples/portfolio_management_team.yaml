@@ -1,0 +1,244 @@
+#!/usr/bin/env cagent run
+version: "2"
+
+# Portfolio Management Team with Model Mixing Optimization
+# 
+# Model Mixing Strategy:
+# - Combines Claude and OpenAI models to balance performance and token costs
+# - Each agent uses multiple models selected dynamically during conversation
+# - Leverages strengths: Claude for reasoning, OpenAI for calculations
+#
+# Token Optimization Features:
+# - Lower max_tokens limits to prevent excessive usage
+# - max_iterations controls to prevent runaway tool calls
+# - Service tier configuration for consistent rate limiting
+# - Strategic model combinations per agent role
+
+models:
+  # The mcp_server model is no longer needed here, as the URL is now
+  # specified directly in the agents' toolsets.
+  qwen3-local:
+    provider: dmr
+    model: ai/qwen3:4B-UD-Q4_K_XL
+    max_tokens: 10000
+    temperature: 0.2
+    #provider_opts:
+    #  runtime_flags: ["--ngl=999", "--threads=8"]
+      
+  gpt5-mini:
+    provider: openai
+    model: gpt-5-mini-2025-08-07  # Correct GPT-5 Mini model name
+    temperature: 0.3
+    max_tokens: 2000
+
+  claude-sonnet-4-5:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+    temperature: 0.2
+    max_tokens: 4000
+    provider_opts:
+      service_tier: "standard_only"  # Use standard tier for more consistent rate limits
+
+  claude-haiku-4-5:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    temperature: 0.1
+    max_tokens: 2000
+    provider_opts:
+      service_tier: "auto"  # Allow priority tier when available, fallback to standard
+
+  # Fast model for quick decisions
+  gpt5-mini-fast:
+    provider: openai
+    model: gpt-5-mini-2025-08-07
+    temperature: 0.1
+    max_tokens: 1000
+
+agents:
+  root:
+    model: claude-sonnet-4-5,claude-haiku-4-5  # Anthropic model mixing: deep reasoning + fast responses
+    #model: qwen3-local                          # Local Qwen3 model for cost efficiency
+    description: "Portfolio management team coordinator"
+    add_date: true
+    max_iterations: 10  # Limit tool usage cycles to prevent rate limit exhaustion
+    num_history_items: 20  # Keep last 20 conversation messages in context
+    instruction: |
+      You are the master portfolio manager that orchestrates a team of specialist agents
+      to manage a trading portfolio. You parse user requests, delegate tasks,
+      and ensure all operations follow strict safety and data integrity protocols.
+
+      You coordinate portfolio management with context-aware communication.
+      
+      **IMPORTANT: Detect your execution mode**
+      - If user is interacting directly (messages, questions): You're in TUI/CLI mode
+      - If alerts arrive without direct interaction: You're in API mode
+      
+      ══════════════════════════════════════════════════════════
+      TUI/CLI MODE (Interactive session):
+      ══════════════════════════════════════════════════════════
+      - User is directly present in this session
+      - DO NOT use Slack tools - user can see your responses directly
+      - Respond normally to user's questions and commands
+      - Present analysis and recommendations in the conversation
+      
+      ══════════════════════════════════════════════════════════
+      API MODE (Webhook-triggered, no direct user interaction):
+      ══════════════════════════════════════════════════════════
+
+      **CRITICAL: Always communicate your decisions to the user via Slack**
+      
+      For TRADE EXECUTION alerts (BUY/SELL) you APPROVE:
+      → Use request_trade_approval() (from portfolio MCP)
+      → Sends interactive Approve/Reject buttons to Slack
+      → Wait for user response via SSE
+      → Execute trade after approval
+      
+      For TRADE EXECUTION alerts (BUY/SELL) you REJECT:
+      → Use slack_post_message() to notify user of rejection
+      → Include: Symbol, reason for rejection, risk analysis
+      → Example: "🚫 GLD BUY rejected - Position at 10.06%, would exceed 10% limit"
+      → Then call mark_alert_processed()
+      
+      For all other alerts (news, earnings, analysis, weak signals):
+      → Use slack_post_message() to notify user of your overall analysis
+      → Example: "📰 AAPL beat earnings by 15% ..." or "A weak signal on AXP crossing over prior day Value area high ..."
+      
+      For checking user questions:
+      → Use slack_get_channel_history() periodically
+      → Use slack_reply_to_thread() to respond
+
+    sub_agents:
+      - risk_manager
+      - market_researcher
+      - trader
+    toolsets:
+      - type: mcp
+        remote:
+          url: "http://127.0.0.1:8001/sse"
+          transport_type: "sse"
+      # Slack MCP via Docker (stdio-based)
+      - type: mcp
+        command: docker
+        args:
+          - run
+          - -i
+          - --rm
+          - -e
+          - SLACK_TEAM_ID
+          - -e
+          - SLACK_CHANNEL_IDS
+          - -e
+          - SLACK_BOT_TOKEN
+          - mcp/slack
+        env:
+          SLACK_TEAM_ID: "TE5QU0XCY"
+          SLACK_CHANNEL_IDS: "C09Q1UU2JUD"
+          SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+        instruction: |
+          Slack tools for API mode communication.
+          ONLY use these when running in API mode (not TUI/CLI mode).
+      
+      - type: think
+      - type: todo
+      - type: memory
+        path: "./data/portfolio_memory.db"
+
+
+  risk_manager:
+    model: gpt5-mini  # Updated to GPT-5 Mini
+    description: "Risk management specialist for portfolio analysis"
+    add_date: true
+    max_iterations: 8
+    num_history_items: 15  # Keep 15 messages for risk analysis context
+    instruction: |
+      You are a risk analysis specialist responsible for analyzing portfolio risk
+      using live data from the connected portfolio trading platform.
+
+      **Only When analyzing alerts:**
+      1. Check current portfolio exposure
+      2. Calculate risk metrics for proposed trade
+      3. Determine if manual approval is needed:
+        - Trades > $5,000: require approval
+        - High volatility stocks: require approval
+        - Portfolio concentration > 20%: require approval
+      4. Transfer to trader with risk assessment and approval recommendation
+
+    toolsets:
+      # This is the correct, documented way to connect to an external MCP server.
+      - type: mcp
+        remote:
+          url: "http://127.0.0.1:8001/sse"
+          transport_type: "sse"
+      - type: think
+      - type: todo
+      - type: memory
+        path: "./data/risk_memory.db"
+
+  market_researcher:
+    model: gpt5-mini  # Updated to GPT-5 Mini
+    description: "Market research and analysis coordinator"
+    add_date: true
+    max_iterations: 6
+    num_history_items: 10  # Keep 10 messages for market research context
+    instruction: |
+      You are a market research coordinator responsible for analyzing market conditions
+      and delegating stock-specific analysis to the stock_analyst.
+    sub_agents:
+      - stock_analyst
+    toolsets:
+      - type: mcp
+        ref: docker:duckduckgo
+      - type: memory
+        path: "./data/market_memory.db"
+
+  stock_analyst:
+    model: gpt5-mini  # Updated to GPT-5 Mini
+    description: "Individual stock analysis specialist"
+    add_date: true
+    max_iterations: 5
+    num_history_items: 12  # Keep 12 messages for stock analysis context
+    instruction: |
+      You are a stock analysis specialist responsible for analyzing specific stocks
+      using Yahoo Finance data.
+    toolsets:
+      - type: mcp
+        command: uvx
+        args: ["yfmcp"]
+      - type: think
+      - type: memory
+        path: "./data/stock_analysis_memory.db"
+
+  trader:
+    model: claude-haiku-4-5  # Temporarily simplified
+    description: "Trading execution specialist"
+    add_date: true
+    max_iterations: 3  # Quick execution, minimal iterations
+    num_history_items: 8  # Keep 8 messages for recent trading context
+    instruction: |
+      You are a trading execution specialist responsible for executing trades
+      based on team recommendations, using the connected portfolio trading platform.
+
+      **Approval Workflow:**
+      -For trades above $5,000 or high-risk trades, you MUST request user approval
+      using request_trade_approval() before executing
+      -Wait for approval event to arrive via SSE
+      -Only execute after receiving approval
+      -If rejected, mark alert as processed and log the reason
+      -If approval times out (30 min), escalate to root for decision
+    
+      **Tools Available:**
+      -  request_trade_approval() - Request approval via Slack
+      -  get_alert_approval_status() - Check approval status
+      -  create_order_from_alert() - Execute approved trades
+      -  list_pending_alerts() - See waiting alerts
+
+    toolsets:
+      # This also uses the correct 'remote' configuration.
+      - type: mcp
+        remote:
+          url: "http://127.0.0.1:8001/sse"
+          transport_type: "sse"
+      - type: think
+      - type: todo
+      - type: memory
+        path: "./data/trading_memory.db"

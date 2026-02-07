@@ -16,7 +16,7 @@ func ConvertParametersToSchema(params any) (shared.FunctionParameters, error) {
 		return nil, err
 	}
 
-	return fixSchemaArrayItems(makeAllRequired(p)), nil
+	return normalizeUnionTypes(fixSchemaArrayItems(makeAllRequired(p))), nil
 }
 
 // makeAllRequired make all the parameters "required"
@@ -94,6 +94,55 @@ func fixSchemaArrayItems(schema shared.FunctionParameters) shared.FunctionParame
 
 		if _, ok := prop["items"]; !ok {
 			prop["items"] = map[string]any{"type": "object"}
+		}
+	}
+
+	return schema
+}
+
+// normalizeUnionTypes converts union types like ["array", "null"] back to simple types
+// for compatibility with AI gateways that don't support JSON Schema union types.
+// This is needed for Cloudflare AI Gateway and similar proxies.
+func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParameters {
+	if schema == nil {
+		return schema
+	}
+
+	propertiesValue, ok := schema["properties"]
+	if !ok {
+		return schema
+	}
+
+	properties, ok := propertiesValue.(map[string]any)
+	if !ok {
+		return schema
+	}
+
+	for _, propValue := range properties {
+		prop, ok := propValue.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// Convert ["type", "null"] to "type" for compatibility
+		if typeArray, ok := prop["type"].([]string); ok {
+			if len(typeArray) == 2 {
+				// Find the non-null type
+				for _, t := range typeArray {
+					if t != "null" {
+						prop["type"] = t
+						break
+					}
+				}
+			}
+		}
+
+		// Recursively handle nested objects and arrays
+		if items, ok := prop["items"].(map[string]any); ok {
+			normalizeUnionTypes(items)
+		}
+		if nestedProps, ok := prop["properties"].(map[string]any); ok {
+			normalizeUnionTypes(map[string]any{"properties": nestedProps})
 		}
 	}
 

@@ -58,13 +58,17 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 				return nil, fmt.Errorf("%s environment variable is required", cfg.TokenKey)
 			}
 			clientOptions = append(clientOptions, option.WithAPIKey(authToken))
-		} else if isCustomProvider(cfg) {
-			// Custom provider (has api_type in ProviderOpts) without token_key - no auth
+		} else if !isCustomProvider(cfg) {
+			// Not a custom provider - use default OpenAI behavior (OPENAI_API_KEY from env)
+			// The OpenAI SDK will automatically look for OPENAI_API_KEY if no key is set
+		} else {
+			// Custom provider without token_key - don't set any API key
+			// This avoids sending an empty Authorization header which some gateways reject
 			slog.Debug("Custom provider with no token_key, sending requests without authentication",
 				"provider", cfg.Provider, "base_url", cfg.BaseURL)
-			clientOptions = append(clientOptions, option.WithAPIKey(""))
+			// Note: We deliberately do NOT call option.WithAPIKey("") here because that
+			// would add an invalid "Authorization: Bearer " header causing 400 errors
 		}
-		// Otherwise let the OpenAI SDK use its default behavior (OPENAI_API_KEY from env)
 
 		if cfg.Provider == "azure" {
 			// Azure configuration
@@ -82,8 +86,14 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 				}
 			}
 		} else if cfg.BaseURL != "" {
-			clientOptions = append(clientOptions, option.WithBaseURL(cfg.BaseURL))
+			// Expand environment variables in base URL (e.g., ${VAR_NAME})
+			expandedBaseURL, err := environment.Expand(ctx, cfg.BaseURL, env)
+			if err != nil {
+				return nil, fmt.Errorf("expanding base_url: %w", err)
+			}
+			clientOptions = append(clientOptions, option.WithBaseURL(expandedBaseURL))
 		}
+
 
 
 		// Apply custom headers from provider config if present

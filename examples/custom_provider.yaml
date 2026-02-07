@@ -18,14 +18,18 @@ providers:
     base_url: https://responses.example.com/
     token_key: API_KEY_ENV_VAR_NAME
 
-  # Example: Cloudflare AI Gateway with custom headers
+  # Example: Cloudflare AI Gateway with custom headers for Google AI Studio
+  # Using OpenAI-compatible endpoint (/compat)
+  # See: https://developers.cloudflare.com/ai-gateway/usage/providers/google-ai-studio/#openai-compatible-endpoint
   cloudflare_gateway:
-    api_type: openai_chatcompletions
-    base_url: https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat
-    token_key: GOOGLE_API_KEY  # Standard Authorization header for provider auth
+    api_type: openai_chatcompletions  # Use Chat Completions API
+    base_url: https://gateway.ai.cloudflare.com/v1/${CLOUDFLARE_ACCOUNT_ID}/${CLOUDFLARE_GATEWAY_ID}/compat
+    # Note: OpenAI SDK automatically appends /chat/completions to base_url
     headers:
-      # Custom header for gateway authentication with environment variable expansion
+      # Gateway authentication (always required)
       cf-aig-authorization: Bearer ${CLOUDFLARE_AI_GATEWAY_TOKEN}
+      # Provider-specific auth - Google uses x-goog-api-key instead of Authorization
+      x-goog-api-key: ${GOOGLE_API_KEY}
 
 # Define models that use the custom providers
 models:
@@ -43,6 +47,8 @@ models:
     max_tokens: 16000
 
   # Model using Cloudflare AI Gateway with custom headers
+  # For OpenAI-compatible endpoint, model must be prefixed with "google-ai-studio/"
+  # See: https://developers.cloudflare.com/ai-gateway/usage/providers/google-ai-studio/#openai-compatible-endpoint
   gemini_via_cloudflare:
     provider: cloudflare_gateway
     model: google-ai-studio/gemini-2.5-flash
