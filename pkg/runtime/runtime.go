@@ -1415,9 +1415,19 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 	// Some providers (e.g. Cloudflare AI Gateway) may send finish_reason="stop" even
 	// when tool calls are present, instead of the expected "tool_calls" finish reason.
 	hasToolCalls := len(toolCalls) > 0
+
+	// When tool calls are present, clear any accumulated content. Some providers
+	// (e.g. Gemini via Cloudflare) reject assistant messages that have both content
+	// and tool_calls in the conversation history. The content on a tool-call response
+	// is typically empty or whitespace anyway.
+	content := fullContent.String()
+	if hasToolCalls && strings.TrimSpace(content) == "" {
+		content = ""
+	}
+
 	return streamResult{
 		Calls:             toolCalls,
-		Content:           fullContent.String(),
+		Content:           content,
 		ReasoningContent:  fullReasoningContent.String(),
 		ThinkingSignature: thinkingSignature,
 		ThoughtSignature:  thoughtSignature,
