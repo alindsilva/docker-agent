@@ -1,6 +1,7 @@
 package teamloader
 
 import (
+	"context"
 	"strings"
 
 	"github.com/docker/cagent/pkg/tools"
@@ -24,6 +25,22 @@ type replaceInstruction struct {
 
 // Verify interface compliance
 var _ tools.Instructable = (*replaceInstruction)(nil)
+
+// Start forwards the Start call to the inner toolset if it implements Startable.
+func (a *replaceInstruction) Start(ctx context.Context) error {
+	if startable, ok := a.ToolSet.(tools.Startable); ok {
+		return startable.Start(ctx)
+	}
+	return nil
+}
+
+// Stop forwards the Stop call to the inner toolset if it implements Startable.
+func (a *replaceInstruction) Stop(ctx context.Context) error {
+	if startable, ok := a.ToolSet.(tools.Startable); ok {
+		return startable.Stop(ctx)
+	}
+	return nil
+}
 
 func (a replaceInstruction) Instructions() string {
 	original := tools.GetInstructions(a.ToolSet)
