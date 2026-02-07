@@ -106,29 +106,54 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 
 		// Apply custom headers from provider config if present
 		if cfg.ProviderOpts != nil {
-			if headersMap, ok := cfg.ProviderOpts["headers"].(map[string]string); ok {
-				slog.Debug("Applying custom headers", "count", len(headersMap), "provider", cfg.Provider)
-				for key, value := range headersMap {
-					// Expand environment variables in header values (e.g., ${VAR_NAME})
-					expandedValue, err := environment.Expand(ctx, value, env)
-					if err != nil {
-						slog.Error("Failed to expand environment variable in header",
-							"header", key,
-							"value", value,
-							"error", err,
-							"provider", cfg.Provider)
-						return nil, fmt.Errorf("expanding header %s: %w", key, err)
+			if headers, exists := cfg.ProviderOpts["headers"]; exists {
+				// Handle both map[string]string and map[interface{}]interface{} from YAML parsing
+				headersMap := make(map[string]string)
+				
+				switch h := headers.(type) {
+				case map[string]string:
+					// Direct map[string]string - use as-is
+					headersMap = h
+				case map[interface{}]interface{}:
+					// YAML parsed as map[interface{}]interface{} - convert
+					for k, v := range h {
+						keyStr, okKey := k.(string)
+						valStr, okVal := v.(string)
+						if !okKey || !okVal {
+							slog.Error("Invalid header key/value type",
+								"key_type", fmt.Sprintf("%T", k),
+								"value_type", fmt.Sprintf("%T", v),
+								"provider", cfg.Provider)
+							return nil, fmt.Errorf("invalid header key/value type: key=%T, value=%T", k, v)
+						}
+						headersMap[keyStr] = valStr
 					}
-					clientOptions = append(clientOptions, option.WithHeader(key, expandedValue))
-					slog.Debug("Applied custom header",
-						"header", key,
+				default:
+					slog.Error("Invalid headers configuration - expected map[string]string or map[interface{}]interface{}",
+						"type", fmt.Sprintf("%T", headers),
 						"provider", cfg.Provider)
+					return nil, fmt.Errorf("invalid headers configuration: expected map[string]string, got %T", headers)
 				}
-			} else if _, exists := cfg.ProviderOpts["headers"]; exists {
-				slog.Error("Invalid headers configuration - expected map[string]string",
-					"type", fmt.Sprintf("%T", cfg.ProviderOpts["headers"]),
-					"provider", cfg.Provider)
-				return nil, fmt.Errorf("invalid headers configuration: expected map[string]string, got %T", cfg.ProviderOpts["headers"])
+				
+				if len(headersMap) > 0 {
+					slog.Debug("Applying custom headers", "count", len(headersMap), "provider", cfg.Provider)
+					for key, value := range headersMap {
+						// Expand environment variables in header values (e.g., ${VAR_NAME})
+						expandedValue, err := environment.Expand(ctx, value, env)
+						if err != nil {
+							slog.Error("Failed to expand environment variable in header",
+								"header", key,
+								"value", value,
+								"error", err,
+								"provider", cfg.Provider)
+							return nil, fmt.Errorf("expanding header %s: %w", key, err)
+						}
+						clientOptions = append(clientOptions, option.WithHeader(key, expandedValue))
+						slog.Debug("Applied custom header",
+							"header", key,
+							"provider", cfg.Provider)
+					}
+				}
 			}
 		}
 
