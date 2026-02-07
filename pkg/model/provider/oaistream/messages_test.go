@@ -214,3 +214,38 @@ func TestJSONSchema_MarshalJSON(t *testing.T) {
 	assert.Contains(t, string(data), `"type":"object"`)
 	assert.Contains(t, string(data), `"properties"`)
 }
+
+func TestConvertMessages_AssistantToolCallsIncludesContent(t *testing.T) {
+	t.Parallel()
+
+	// When an assistant message has tool calls but no text content,
+	// the serialized JSON must still include a "content" field.
+	// Some providers (e.g., Gemini via Cloudflare) reject messages
+	// where the content field is missing entirely from the JSON.
+	messages := []chat.Message{
+		{
+			Role:    chat.MessageRoleAssistant,
+			Content: "",
+			ToolCalls: []tools.ToolCall{
+				{
+					ID: "call_123",
+					Function: tools.FunctionCall{
+						Name:      "get_portfolio",
+						Arguments: "{}",
+					},
+				},
+			},
+		},
+	}
+
+	result := ConvertMessages(messages)
+	require.Len(t, result, 1)
+	require.NotNil(t, result[0].OfAssistant)
+
+	// Verify the content field is set (even if empty)
+	assert.True(t, result[0].OfAssistant.Content.OfString.Valid(),
+		"content field must be present on assistant messages with tool calls")
+
+	// Verify tool calls are preserved
+	assert.Len(t, result[0].OfAssistant.ToolCalls, 1)
+}

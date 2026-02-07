@@ -86,6 +86,11 @@ func ConvertMessages(messages []chat.Message) []openai.ChatCompletionMessagePara
 			if len(msg.MultiContent) == 0 {
 				if msg.Content != "" {
 					assistantParam.Content.OfString = param.NewOpt(msg.Content)
+				} else if len(msg.ToolCalls) > 0 {
+					// Always include content field for assistant messages with tool calls.
+					// Some providers (e.g., Gemini via Cloudflare) reject messages where
+					// the content field is missing entirely from the JSON.
+					assistantParam.Content.OfString = param.NewOpt("")
 				}
 			} else {
 				// Convert multi-content for assistant messages
