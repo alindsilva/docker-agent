@@ -154,39 +154,61 @@ func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParame
 	}
 
 	// Convert union types at the current level
+	// Only normalize nullable patterns: exactly 2 types where one is "null"
 	if typeArray, ok := schema["type"].([]any); ok {
 		if len(typeArray) == 2 {
-			// Find the non-null type
+			var hasNull bool
+			var nonNullType string
 			for _, t := range typeArray {
-				if tStr, ok := t.(string); ok && tStr != "null" {
-					schema["type"] = tStr
-					break
+				if tStr, ok := t.(string); ok {
+					if tStr == "null" {
+						hasNull = true
+					} else {
+						nonNullType = tStr
+					}
 				}
+			}
+			if hasNull && nonNullType != "" {
+				schema["type"] = nonNullType
 			}
 		}
 	} else if typeArray, ok := schema["type"].([]string); ok {
 		if len(typeArray) == 2 {
-			// Find the non-null type
+			var hasNull bool
+			var nonNullType string
 			for _, t := range typeArray {
-				if t != "null" {
-					schema["type"] = t
-					break
+				if t == "null" {
+					hasNull = true
+				} else {
+					nonNullType = t
 				}
+			}
+			if hasNull && nonNullType != "" {
+				schema["type"] = nonNullType
 			}
 		}
 	}
 
-	// Convert anyOf patterns like {"anyOf": [{"type":"string"},{"type":"null"}]} to {"type":"string"}
+	// Convert nullable anyOf patterns like {"anyOf": [{"type":"string"},{"type":"null"}]} to {"type":"string"}
+	// Only normalize when there are exactly 2 alternatives and one is {"type":"null"}.
 	// This is needed for Gemini via Cloudflare which doesn't support anyOf in tool parameters.
-	if anyOf, ok := schema["anyOf"].([]any); ok {
+	if anyOf, ok := schema["anyOf"].([]any); ok && len(anyOf) == 2 {
+		hasNull := false
+		var nonNullType string
 		for _, item := range anyOf {
 			if itemMap, ok := item.(map[string]any); ok {
-				if typStr, ok := itemMap["type"].(string); ok && typStr != "null" {
-					schema["type"] = typStr
-					delete(schema, "anyOf")
-					break
+				if typStr, ok := itemMap["type"].(string); ok {
+					if typStr == "null" {
+						hasNull = true
+					} else {
+						nonNullType = typStr
+					}
 				}
 			}
+		}
+		if hasNull && nonNullType != "" {
+			schema["type"] = nonNullType
+			delete(schema, "anyOf")
 		}
 	}
 

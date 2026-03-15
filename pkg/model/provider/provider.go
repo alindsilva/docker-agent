@@ -335,9 +335,14 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 			}
 
 			// Copy custom headers from provider config if not already set in provider_opts
+			// Deep-copy the map to avoid mutating the shared provider config
 			if _, hasHeaders := enhancedCfg.ProviderOpts["headers"]; !hasHeaders {
 				if len(providerCfg.Headers) > 0 {
-					enhancedCfg.ProviderOpts["headers"] = providerCfg.Headers
+					headersCopy := make(map[string]string, len(providerCfg.Headers))
+					for k, v := range providerCfg.Headers {
+						headersCopy[k] = v
+					}
+					enhancedCfg.ProviderOpts["headers"] = headersCopy
 				}
 			}
 

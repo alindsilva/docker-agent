@@ -86,7 +86,6 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 				slog.Debug("Stream API error details",
 					"agent", a.Name(),
 					"status_code", apiErr.StatusCode,
-					"response_body", string(apiErr.DumpResponse(true)),
 				)
 			}
 			return streamResult{Stopped: true}, fmt.Errorf("error receiving from stream: %w", err)

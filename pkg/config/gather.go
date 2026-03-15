@@ -124,8 +124,9 @@ func addEnvVarsForModelConfig(model *latest.ModelConfig, customProviders map[str
 		}
 	}
 
-	// Gather env vars from headers (model-level and provider-level)
+	// Gather env vars from headers (model-level and provider-level) and base URLs
 	gatherEnvVarsFromHeaders(model.Headers, requiredEnv)
+	gatherEnvVarsFromString(model.BaseURL, requiredEnv)
 	if customProviders != nil {
 		if provCfg, exists := customProviders[model.Provider]; exists {
 			gatherEnvVarsFromHeaders(provCfg.Headers, requiredEnv)

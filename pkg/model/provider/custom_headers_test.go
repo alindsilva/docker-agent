@@ -12,12 +12,12 @@ func TestApplyProviderDefaults_WithHeaders(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name             string
-		providerName     string
-		providerCfg      latest.ProviderConfig
-		modelCfg         latest.ModelConfig
-		expectedHeaders  map[string]string
-		headersInOpts    bool
+		name            string
+		providerName    string
+		providerCfg     latest.ProviderConfig
+		modelCfg        latest.ModelConfig
+		expectedHeaders map[string]string
+		headersInOpts   bool
 	}{
 		{
 			name:         "custom provider with headers",

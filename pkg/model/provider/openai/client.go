@@ -82,7 +82,11 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		if cfg.Provider == "azure" {
 			// Azure configuration
 			if cfg.BaseURL != "" {
-				clientOptions = append(clientOptions, option.WithBaseURL(cfg.BaseURL))
+				expandedBaseURL, err := environment.Expand(ctx, cfg.BaseURL, env)
+				if err != nil {
+					return nil, fmt.Errorf("expanding base_url: %w", err)
+				}
+				clientOptions = append(clientOptions, option.WithBaseURL(expandedBaseURL))
 			}
 
 			// Azure API version from provider opts
@@ -95,7 +99,11 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 				}
 			}
 		} else if cfg.BaseURL != "" {
-			clientOptions = append(clientOptions, option.WithBaseURL(cfg.BaseURL))
+			expandedBaseURL, err := environment.Expand(ctx, cfg.BaseURL, env)
+			if err != nil {
+				return nil, fmt.Errorf("expanding base_url: %w", err)
+			}
+			clientOptions = append(clientOptions, option.WithBaseURL(expandedBaseURL))
 		}
 
 
@@ -138,7 +146,6 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 						if err != nil {
 							slog.Error("Failed to expand environment variable in header",
 								"header", key,
-								"value", value,
 								"error", err,
 								"provider", cfg.Provider)
 							return nil, fmt.Errorf("expanding header %s: %w", key, err)
