@@ -16,7 +16,7 @@ func ConvertParametersToSchema(params any) (shared.FunctionParameters, error) {
 		return nil, err
 	}
 
-	return fixSchemaArrayItems(removeFormatFields(makeAllRequired(p))), nil
+	return normalizeUnionTypes(fixSchemaArrayItems(removeFormatFields(makeAllRequired(p)))), nil
 }
 
 // walkSchema calls fn on the given schema node, then recursively walks into
@@ -140,6 +140,75 @@ func fixSchemaArrayItems(schema shared.FunctionParameters) shared.FunctionParame
 		if _, ok := prop["items"]; !ok {
 			prop["items"] = map[string]any{"type": "object"}
 		}
+	}
+
+	return schema
+}
+
+// normalizeUnionTypes converts union types like ["array", "null"] back to simple types
+// for compatibility with AI gateways that don't support JSON Schema union types.
+// This is needed for Cloudflare AI Gateway and similar proxies.
+func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParameters {
+	if schema == nil {
+		return schema
+	}
+
+	// Convert union types at the current level
+	if typeArray, ok := schema["type"].([]any); ok {
+		if len(typeArray) == 2 {
+			// Find the non-null type
+			for _, t := range typeArray {
+				if tStr, ok := t.(string); ok && tStr != "null" {
+					schema["type"] = tStr
+					break
+				}
+			}
+		}
+	} else if typeArray, ok := schema["type"].([]string); ok {
+		if len(typeArray) == 2 {
+			// Find the non-null type
+			for _, t := range typeArray {
+				if t != "null" {
+					schema["type"] = t
+					break
+				}
+			}
+		}
+	}
+
+	// Convert anyOf patterns like {"anyOf": [{"type":"string"},{"type":"null"}]} to {"type":"string"}
+	// This is needed for Gemini via Cloudflare which doesn't support anyOf in tool parameters.
+	if anyOf, ok := schema["anyOf"].([]any); ok {
+		for _, item := range anyOf {
+			if itemMap, ok := item.(map[string]any); ok {
+				if typStr, ok := itemMap["type"].(string); ok && typStr != "null" {
+					schema["type"] = typStr
+					delete(schema, "anyOf")
+					break
+				}
+			}
+		}
+	}
+
+	// Recursively handle properties
+	if propertiesValue, ok := schema["properties"]; ok {
+		if properties, ok := propertiesValue.(map[string]any); ok {
+			for _, propValue := range properties {
+				if prop, ok := propValue.(map[string]any); ok {
+					normalizeUnionTypes(prop)
+				}
+			}
+		}
+	}
+
+	// Recursively handle items (for arrays)
+	if items, ok := schema["items"].(map[string]any); ok {
+		normalizeUnionTypes(items)
+	}
+
+	// Recursively handle additionalProperties
+	if addProps, ok := schema["additionalProperties"].(map[string]any); ok {
+		normalizeUnionTypes(addProps)
 	}
 
 	return schema
