@@ -239,5 +239,5 @@ func TestCustomProvider_WithoutTokenKey(t *testing.T) {
 	defer mu.Unlock()
 	// When no token_key is set, our middleware strips the Authorization header
 	// to prevent empty Bearer tokens from being sent to custom providers
-	assert.Equal(t, "", receivedAuth, "Should strip Authorization header when no token_key")
+	assert.Empty(t, receivedAuth, "Should strip Authorization header when no token_key")
 }

@@ -3,9 +3,10 @@ package provider
 import (
 	"testing"
 
-	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/config/latest"
 )
 
 func TestApplyProviderDefaults_WithHeaders(t *testing.T) {

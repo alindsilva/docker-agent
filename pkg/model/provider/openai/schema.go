@@ -150,12 +150,13 @@ func fixSchemaArrayItems(schema shared.FunctionParameters) shared.FunctionParame
 // This is needed for Cloudflare AI Gateway and similar proxies.
 func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParameters {
 	if schema == nil {
-		return schema
+		return nil
 	}
 
 	// Convert union types at the current level
 	// Only normalize nullable patterns: exactly 2 types where one is "null"
-	if typeArray, ok := schema["type"].([]any); ok {
+	switch typeArray := schema["type"].(type) {
+	case []any:
 		if len(typeArray) == 2 {
 			var hasNull bool
 			var nonNullType string
@@ -172,7 +173,7 @@ func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParame
 				schema["type"] = nonNullType
 			}
 		}
-	} else if typeArray, ok := schema["type"].([]string); ok {
+	case []string:
 		if len(typeArray) == 2 {
 			var hasNull bool
 			var nonNullType string

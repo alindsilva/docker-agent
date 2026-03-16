@@ -339,9 +339,7 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 			if _, hasHeaders := enhancedCfg.ProviderOpts["headers"]; !hasHeaders {
 				if len(providerCfg.Headers) > 0 {
 					headersCopy := make(map[string]string, len(providerCfg.Headers))
-					for k, v := range providerCfg.Headers {
-						headersCopy[k] = v
-					}
+					maps.Copy(headersCopy, providerCfg.Headers)
 					enhancedCfg.ProviderOpts["headers"] = headersCopy
 				}
 			}
@@ -352,9 +350,7 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 				if existing == nil {
 					existing = make(map[string]string)
 				}
-				for k, v := range enhancedCfg.Headers {
-					existing[k] = v
-				}
+				maps.Copy(existing, enhancedCfg.Headers)
 				enhancedCfg.ProviderOpts["headers"] = existing
 			}
 
@@ -384,9 +380,7 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 		if existing == nil {
 			existing = make(map[string]string)
 		}
-		for k, v := range enhancedCfg.Headers {
-			existing[k] = v
-		}
+		maps.Copy(existing, enhancedCfg.Headers)
 		enhancedCfg.ProviderOpts["headers"] = existing
 	}
 

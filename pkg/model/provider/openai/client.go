@@ -52,17 +52,18 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	if gateway := globalOptions.Gateway(); gateway == "" {
 		var clientOptions []option.RequestOption
 
-		if cfg.TokenKey != "" {
+		switch {
+		case cfg.TokenKey != "":
 			// Explicit token_key configured - use that env var
 			authToken, _ := env.Get(ctx, cfg.TokenKey)
 			if authToken == "" {
 				return nil, fmt.Errorf("%s environment variable is required", cfg.TokenKey)
 			}
 			clientOptions = append(clientOptions, option.WithAPIKey(authToken))
-		} else if !isCustomProvider(cfg) {
+		case !isCustomProvider(cfg):
 			// Not a custom provider - use default OpenAI behavior (OPENAI_API_KEY from env)
 			// The OpenAI SDK will automatically look for OPENAI_API_KEY if no key is set
-		} else {
+		default:
 			// Custom provider without token_key - prevent SDK from using OPENAI_API_KEY env var
 			// We need to explicitly set the API key to prevent the SDK from reading OPENAI_API_KEY
 			// but we don't want to send an Authorization header. The SDK doesn't send the header
@@ -105,7 +106,6 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			}
 			clientOptions = append(clientOptions, option.WithBaseURL(expandedBaseURL))
 		}
-
 
 		// Apply custom headers from provider config if present
 		if cfg.ProviderOpts != nil {
