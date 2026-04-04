@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"strings"
 
@@ -19,10 +17,12 @@ import (
 
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/effort"
 	"github.com/docker/docker-agent/pkg/environment"
 	"github.com/docker/docker-agent/pkg/httpclient"
 	"github.com/docker/docker-agent/pkg/model/provider/base"
 	"github.com/docker/docker-agent/pkg/model/provider/options"
+	"github.com/docker/docker-agent/pkg/model/provider/providerutil"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -30,32 +30,31 @@ import (
 // It holds the anthropic client and model config
 type Client struct {
 	base.Config
-	clientFn         func(context.Context) (anthropic.Client, error)
-	lastHTTPResponse *http.Response
-	fileManager      *FileManager
-}
 
-func (c *Client) getResponseTrailer() http.Header {
-	if c.lastHTTPResponse == nil {
-		return nil
-	}
-
-	if c.lastHTTPResponse.Body != nil {
-		_, _ = io.Copy(io.Discard, c.lastHTTPResponse.Body)
-	}
-
-	return c.lastHTTPResponse.Trailer
+	clientFn    func(context.Context) (anthropic.Client, error)
+	fileManager *FileManager
 }
 
 // adjustMaxTokensForThinking checks if max_tokens needs adjustment for thinking_budget.
 // Anthropic's max_tokens represents the combined budget for thinking + output tokens.
 // Returns the adjusted maxTokens value and an error if user-set max_tokens is too low.
+//
+// Only fixed token budgets need adjustment. Adaptive and effort-based budgets
+// don't need it since the model manages its own thinking allocation.
 func (c *Client) adjustMaxTokensForThinking(maxTokens int64) (int64, error) {
-	if c.ModelConfig.ThinkingBudget == nil || c.ModelConfig.ThinkingBudget.Tokens <= 0 {
+	if c.ModelConfig.ThinkingBudget == nil {
+		return maxTokens, nil
+	}
+	// Adaptive and effort-based budgets: no token adjustment needed.
+	if _, ok := anthropicThinkingEffort(c.ModelConfig.ThinkingBudget); ok {
 		return maxTokens, nil
 	}
 
 	thinkingTokens := int64(c.ModelConfig.ThinkingBudget.Tokens)
+	if thinkingTokens <= 0 {
+		return maxTokens, nil
+	}
+
 	minRequired := thinkingTokens + 1024 // configured thinking budget + minimum output buffer
 
 	if maxTokens <= thinkingTokens {
@@ -150,7 +149,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		slog.Debug("Anthropic API key found, creating client")
 		requestOptions := []option.RequestOption{
 			option.WithAPIKey(authToken),
-			option.WithHTTPClient(httpclient.NewHTTPClient()),
+			option.WithHTTPClient(httpclient.NewHTTPClient(ctx)),
 		}
 		if cfg.BaseURL != "" {
 			expandedBaseURL, err := environment.Expand(ctx, cfg.BaseURL, env)
@@ -228,11 +227,10 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			}
 
 			client := anthropic.NewClient(
-				option.WithResponseInto(&anthropicClient.lastHTTPResponse),
 				option.WithAuthToken(authToken),
 				option.WithAPIKey(authToken),
 				option.WithBaseURL(baseURL),
-				option.WithHTTPClient(httpclient.NewHTTPClient(httpOptions...)),
+				option.WithHTTPClient(httpclient.NewHTTPClient(ctx, httpOptions...)),
 			)
 
 			return client, nil
@@ -323,7 +321,7 @@ func (c *Client) CreateChatCompletionStream(
 	sys := extractSystemBlocks(messages)
 
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(c.ModelConfig.Model),
+		Model:     c.ModelConfig.Model,
 		MaxTokens: maxTokens,
 		System:    sys,
 		Messages:  converted,
@@ -332,17 +330,17 @@ func (c *Client) CreateChatCompletionStream(
 
 	// Apply thinking budget first, as it affects whether we can set temperature
 	thinkingEnabled := false
-	if c.ModelConfig.ThinkingBudget != nil && c.ModelConfig.ThinkingBudget.Tokens > 0 {
-		thinkingTokens := int64(c.ModelConfig.ThinkingBudget.Tokens)
-		switch {
-		case thinkingTokens >= 1024 && thinkingTokens < maxTokens:
-			params.Thinking = anthropic.ThinkingConfigParamOfEnabled(thinkingTokens)
+	if budget := c.ModelConfig.ThinkingBudget; budget != nil {
+		if effortStr, ok := anthropicThinkingEffort(budget); ok {
+			adaptive := anthropic.ThinkingConfigAdaptiveParam{}
+			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &adaptive}
+			params.OutputConfig.Effort = anthropic.OutputConfigEffort(effortStr)
 			thinkingEnabled = true
-			slog.Debug("Anthropic API using thinking_budget (standard messages)", "budget_tokens", thinkingTokens)
-		case thinkingTokens >= maxTokens:
-			slog.Warn("Anthropic thinking_budget must be less than max_tokens, ignoring", "tokens", thinkingTokens, "max_tokens", maxTokens)
-		default:
-			slog.Warn("Anthropic thinking_budget below minimum (1024), ignoring", "tokens", thinkingTokens)
+			slog.Debug("Anthropic API using adaptive thinking", "effort", effortStr)
+		} else if tokens, ok := validThinkingTokens(int64(budget.Tokens), maxTokens); ok {
+			params.Thinking = anthropic.ThinkingConfigParamOfEnabled(tokens)
+			thinkingEnabled = true
+			slog.Debug("Anthropic API using thinking_budget", "budget_tokens", tokens)
 		}
 	}
 
@@ -357,6 +355,12 @@ func (c *Client) CreateChatCompletionStream(
 		}
 	} else if c.ModelConfig.Temperature != nil || c.ModelConfig.TopP != nil {
 		slog.Debug("Anthropic extended thinking enabled, ignoring temperature/top_p settings")
+	}
+
+	// Forward top_k from provider_opts (Anthropic natively supports it)
+	if topK, ok := providerutil.GetProviderOptInt64(c.ModelConfig.ProviderOpts, "top_k"); ok {
+		params.TopK = param.NewOpt(topK)
+		slog.Debug("Anthropic provider_opts: set top_k", "value", topK)
 	}
 
 	if len(requestTools) > 0 {
@@ -386,7 +390,7 @@ func (c *Client) CreateChatCompletionStream(
 
 	// Set up single retry for context length errors
 	ad.retryFn = func() *ssestream.Stream[anthropic.MessageStreamEventUnion] {
-		used, err := countAnthropicTokens(ctx, client, anthropic.Model(c.ModelConfig.Model), converted, sys, allTools)
+		used, err := countAnthropicTokens(ctx, client, c.ModelConfig.Model, converted, sys, allTools)
 		if err != nil {
 			slog.Warn("Failed to count tokens for retry, skipping", "error", err)
 			return nil
@@ -928,6 +932,38 @@ func differenceIDs(a, b map[string]struct{}) []string {
 		}
 	}
 	return missing
+}
+
+// validThinkingTokens validates that the token budget is within the
+// acceptable range for Anthropic (>= 1024 and < maxTokens).
+// Returns (tokens, true) if valid, or (0, false) with a warning log if not.
+func validThinkingTokens(tokens, maxTokens int64) (int64, bool) {
+	if tokens < 1024 {
+		slog.Warn("Anthropic thinking_budget below minimum (1024), ignoring", "tokens", tokens)
+		return 0, false
+	}
+	if tokens >= maxTokens {
+		slog.Warn("Anthropic thinking_budget must be less than max_tokens, ignoring", "tokens", tokens, "max_tokens", maxTokens)
+		return 0, false
+	}
+	return tokens, true
+}
+
+// anthropicThinkingEffort returns the Anthropic API effort level for the given
+// ThinkingBudget. It covers both explicit adaptive mode and string effort
+// levels. Returns ("", false) when the budget uses token counts or is nil.
+func anthropicThinkingEffort(b *latest.ThinkingBudget) (string, bool) {
+	if b == nil {
+		return "", false
+	}
+	if e, ok := b.AdaptiveEffort(); ok {
+		return e, true
+	}
+	l, ok := b.EffortLevel()
+	if !ok {
+		return "", false
+	}
+	return effort.ForAnthropic(l)
 }
 
 // anthropicContextLimit returns a reasonable default context window for Anthropic models.

@@ -22,7 +22,6 @@ import (
 	"github.com/docker/docker-agent/pkg/model/provider/options"
 	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/permissions"
-	"github.com/docker/docker-agent/pkg/rag"
 	"github.com/docker/docker-agent/pkg/skills"
 	"github.com/docker/docker-agent/pkg/team"
 	"github.com/docker/docker-agent/pkg/tools"
@@ -122,20 +121,9 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 		return nil, err
 	}
 
-	// Create RAG managers
+	// Load agents
 	parentDir := cmp.Or(agentSource.ParentDir(), runConfig.WorkingDir)
 	configName := configNameFromSource(agentSource.Name())
-	ragManagers, err := rag.NewManagers(ctx, cfg, rag.ManagersBuildConfig{
-		ParentDir:     parentDir,
-		ModelsGateway: runConfig.ModelsGateway,
-		Env:           env,
-		Models:        cfg.Models,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create RAG managers: %w", err)
-	}
-
-	// Load agents
 	var agents []*agent.Agent
 	agentsByName := make(map[string]*agent.Agent)
 
@@ -144,6 +132,8 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	})
 
 	expander := js.NewJsExpander(env)
+
+	cliHooks := runConfig.CLIHooks()
 
 	for _, agentConfig := range cfg.Agents {
 		// Merge CLI prompt files with agent config prompt files, deduplicating
@@ -168,12 +158,14 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 			agent.WithAddDescriptionParameter(agentConfig.AddDescriptionParameter),
 			agent.WithAddPromptFiles(promptFiles),
 			agent.WithMaxIterations(agentConfig.MaxIterations),
+			agent.WithMaxConsecutiveToolCalls(agentConfig.MaxConsecutiveToolCalls),
+			agent.WithMaxOldToolCallTokens(agentConfig.MaxOldToolCallTokens),
 			agent.WithNumHistoryItems(agentConfig.NumHistoryItems),
 			agent.WithCommands(expander.ExpandCommands(ctx, agentConfig.Commands)),
-			agent.WithHooks(agentConfig.Hooks),
+			agent.WithHooks(config.MergeHooks(agentConfig.Hooks, cliHooks)),
 		}
 
-		models, thinkingConfigured, err := getModelsForAgent(ctx, cfg, &agentConfig, autoModel, runConfig)
+		models, err := getModelsForAgent(ctx, cfg, &agentConfig, autoModel, runConfig)
 		if err != nil {
 			// Return auto model fallback errors and DMR not installed errors directly
 			// without wrapping to provide cleaner messages
@@ -185,7 +177,6 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 		for _, model := range models {
 			opts = append(opts, agent.WithModel(model))
 		}
-		opts = append(opts, agent.WithThinkingConfigured(thinkingConfigured))
 
 		// Load fallback models if configured
 		fallbackModelRefs := agentConfig.GetFallbackModels()
@@ -208,17 +199,11 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 			opts = append(opts, agent.WithLoadTimeWarnings(warnings))
 		}
 
-		// Add RAG tools if agent has RAG sources
-		if len(agentConfig.RAG) > 0 {
-			ragTools := createRAGToolsForAgent(&agentConfig, ragManagers)
-			agentTools = append(agentTools, ragTools...)
-		}
-
 		// Add skills toolset if skills are enabled
 		if agentConfig.Skills.Enabled() {
 			loadedSkills := skills.Load(agentConfig.Skills.Sources)
 			if len(loadedSkills) > 0 {
-				agentTools = append(agentTools, builtin.NewSkillsToolset(loadedSkills))
+				agentTools = append(agentTools, builtin.NewSkillsToolset(loadedSkills, runConfig.WorkingDir))
 			}
 		}
 
@@ -272,7 +257,6 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	return &LoadResult{
 		Team: team.New(
 			team.WithAgents(agents...),
-			team.WithRAGManagers(ragManagers),
 			team.WithPermissions(permChecker),
 		),
 		Models:             cfg.Models,
@@ -281,9 +265,11 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	}, nil
 }
 
-func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentConfig, autoModelFn func() latest.ModelConfig, runConfig *config.RuntimeConfig) ([]provider.Provider, bool, error) {
+func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentConfig, autoModelFn func() latest.ModelConfig, runConfig *config.RuntimeConfig) ([]provider.Provider, error) {
 	var models []provider.Provider
-	thinkingConfigured := false
+
+	// Obtain the singleton store once, outside the loop.
+	modelsStore, modelsStoreErr := modelsdev.NewStore()
 
 	for name := range strings.SplitSeq(a.Model, ",") {
 		modelCfg, exists := cfg.Models[name]
@@ -293,27 +279,16 @@ func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentC
 				modelCfg = autoModelFn()
 				isAutoModel = true
 			} else {
-				return nil, false, fmt.Errorf("model '%s' not found in configuration", name)
+				return nil, fmt.Errorf("model '%s' not found in configuration", name)
 			}
 		}
 		modelCfg.Name = name
-
-		// Check if thinking_budget was explicitly configured BEFORE provider defaults are applied.
-		// This is used to initialize session thinking state - thinking is only enabled by default
-		// when the user explicitly configured it in their YAML.
-		if modelCfg.ThinkingBudget != nil && !modelCfg.ThinkingBudget.IsDisabled() {
-			thinkingConfigured = true
-		}
 
 		// Use max_tokens from config if specified, otherwise look up from models.dev
 		maxTokens := &defaultMaxTokens
 		if modelCfg.MaxTokens != nil {
 			maxTokens = modelCfg.MaxTokens
-		} else {
-			modelsStore, err := modelsdev.NewStore()
-			if err != nil {
-				return nil, false, err
-			}
+		} else if modelsStoreErr == nil {
 			m, err := modelsStore.GetModel(ctx, modelCfg.Provider+"/"+modelCfg.Model)
 			if err == nil {
 				maxTokens = &m.Limit.Output
@@ -339,20 +314,23 @@ func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentC
 		if err != nil {
 			// Return a cleaner error message for auto model selection failures
 			if isAutoModel {
-				return nil, false, &config.AutoModelFallbackError{}
+				return nil, &config.AutoModelFallbackError{}
 			}
-			return nil, false, err
+			return nil, err
 		}
 		models = append(models, model)
 	}
 
-	return models, thinkingConfigured, nil
+	return models, nil
 }
 
 // getFallbackModelsForAgent returns fallback providers for an agent based on its fallback configuration.
 // It uses the same resolution logic as primary models (named model, inline provider/model format).
 func getFallbackModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentConfig, runConfig *config.RuntimeConfig) ([]provider.Provider, error) {
 	var fallbackModels []provider.Provider
+
+	// Obtain the singleton store once, outside the loop.
+	modelsStore, modelsStoreErr := modelsdev.NewStore()
 
 	for _, name := range a.GetFallbackModels() {
 		modelCfg, exists := cfg.Models[name]
@@ -370,11 +348,7 @@ func getFallbackModelsForAgent(ctx context.Context, cfg *latest.Config, a *lates
 		maxTokens := &defaultMaxTokens
 		if modelCfg.MaxTokens != nil {
 			maxTokens = modelCfg.MaxTokens
-		} else {
-			modelsStore, err := modelsdev.NewStore()
-			if err != nil {
-				return nil, err
-			}
+		} else if modelsStoreErr == nil {
 			m, err := modelsStore.GetModel(ctx, modelCfg.Provider+"/"+modelCfg.Model)
 			if err == nil {
 				maxTokens = &m.Limit.Output
@@ -510,6 +484,8 @@ func configNameFromSource(sourceName string) string {
 // References that match a locally-defined agent name are looked up directly.
 // References that are external (OCI or URL) are loaded on-demand and cached
 // in externalAgents so the same reference isn't loaded twice.
+// External references may include an explicit name prefix ("name:ref") or
+// derive a short name from the reference (e.g. "agentcatalog/review-pr" → "review-pr").
 func resolveAgentRefs(
 	ctx context.Context,
 	refs []string,
@@ -537,12 +513,25 @@ func resolveAgentRefs(
 			continue
 		}
 
-		a, err := loadExternalAgent(ctx, ref, runConfig, loadOpts)
-		if err != nil {
-			return nil, fmt.Errorf("loading %q: %w", ref, err)
+		agentName, externalRef := config.ParseExternalAgentRef(ref)
+
+		// Check for name collisions before loading the external agent.
+		if existing, ok := agentsByName[agentName]; ok {
+			return nil, fmt.Errorf("external agent %q resolves to name %q which conflicts with agent %q", ref, agentName, existing.Name())
 		}
+
+		a, err := loadExternalAgent(ctx, externalRef, runConfig, loadOpts)
+		if err != nil {
+			return nil, fmt.Errorf("loading %q: %w", externalRef, err)
+		}
+
+		// Rename the external agent so it doesn't collide with locally-defined
+		// agents (external agents typically have the name "root").
+		agent.WithName(agentName)(a)
+
 		*agents = append(*agents, a)
 		externalAgents[ref] = a
+		agentsByName[agentName] = a
 		resolved = append(resolved, a)
 	}
 	return resolved, nil
@@ -593,38 +582,4 @@ func externalDepthFromContext(ctx context.Context) int {
 
 func contextWithExternalDepth(ctx context.Context, depth int) context.Context {
 	return context.WithValue(ctx, externalDepthKey, depth)
-}
-
-// createRAGToolsForAgent creates RAG tools for an agent, one for each referenced RAG source
-func createRAGToolsForAgent(agentConfig *latest.AgentConfig, allManagers map[string]*rag.Manager) []tools.ToolSet {
-	if len(agentConfig.RAG) == 0 {
-		return nil
-	}
-
-	var ragTools []tools.ToolSet
-
-	for _, ragName := range agentConfig.RAG {
-		mgr, exists := allManagers[ragName]
-		if !exists {
-			slog.Error("RAG source not found", "rag_source", ragName)
-			continue
-		}
-
-		// Use custom tool name if configured, otherwise use the RAG source name
-		toolName := cmp.Or(mgr.ToolName(), ragName)
-
-		// Create a separate tool for this RAG source
-		ragTool := builtin.NewRAGTool(mgr, toolName)
-
-		ragTools = append(ragTools, ragTool)
-
-		slog.Debug("Created RAG tool for agent",
-			"rag_source", ragName,
-			"tool_name", toolName,
-			"manager_name", mgr.Name(),
-			"description", mgr.Description(),
-			"instruction", mgr.ToolInstruction())
-	}
-
-	return ragTools
 }

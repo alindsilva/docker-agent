@@ -50,10 +50,12 @@ Optionally provide a description as an argument to skip the initial prompt.`,
 	return cmd
 }
 
-func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("new", args)
-
+func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) (commandErr error) {
 	ctx := cmd.Context()
+	telemetry.TrackCommand(ctx, "new", args)
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(ctx, "new", args, commandErr)
+	}()
 
 	t, err := creator.Agent(ctx, &f.runConfig, f.modelParam)
 	if err != nil {
@@ -80,10 +82,10 @@ func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) error {
 
 	sess := session.New(sessOpts...)
 
-	return runTUI(ctx, rt, sess, nil, nil, appOpts...)
+	return runTUI(ctx, rt, sess, nil, nil, nil, appOpts...)
 }
 
-func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spawner tui.SessionSpawner, cleanup func(), opts ...app.Opt) error {
+func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spawner tui.SessionSpawner, cleanup func(), tuiOpts []tui.Option, opts ...app.Opt) error {
 	if gen := rt.TitleGenerator(); gen != nil {
 		opts = append(opts, app.WithTitleGenerator(gen))
 	}
@@ -106,17 +108,9 @@ func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spaw
 		cleanup = func() {}
 	}
 	wd, _ := os.Getwd()
-	model := tui.New(ctx, spawner, a, wd, cleanup)
+	model := tui.New(ctx, spawner, a, wd, cleanup, tuiOpts...)
 
-	programOpts := []tea.ProgramOption{tea.WithContext(ctx), tea.WithFilter(filter)}
-
-	// Terminal multiplexers can drop frames at the default 60 FPS, making
-	// spinners appear static. Cap the renderer at 30 FPS when detected.
-	if inMultiplexer() {
-		programOpts = append(programOpts, tea.WithFPS(30))
-	}
-
-	p := tea.NewProgram(model, programOpts...)
+	p := tea.NewProgram(model, tea.WithContext(ctx), tea.WithFilter(filter))
 	coalescer.SetSender(p.Send)
 
 	if m, ok := model.(interface{ SetProgram(p *tea.Program) }); ok {
@@ -125,17 +119,4 @@ func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, spaw
 
 	_, err := p.Run()
 	return err
-}
-
-// inMultiplexer reports whether the process is running inside a terminal
-// multiplexer (tmux, screen).
-func inMultiplexer() bool {
-	if os.Getenv("TMUX") != "" {
-		return true
-	}
-	if os.Getenv("STY") != "" {
-		return true
-	}
-	term := os.Getenv("TERM")
-	return strings.HasPrefix(term, "tmux") || strings.HasPrefix(term, "screen")
 }

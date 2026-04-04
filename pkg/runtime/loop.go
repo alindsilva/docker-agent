@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,8 +16,6 @@ import (
 	"github.com/docker/docker-agent/pkg/agent"
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/compaction"
-	"github.com/docker/docker-agent/pkg/model/provider"
-	"github.com/docker/docker-agent/pkg/model/provider/options"
 	"github.com/docker/docker-agent/pkg/modelerrors"
 	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/session"
@@ -34,6 +31,7 @@ func (r *LocalRuntime) registerDefaultTools() {
 	r.toolMap[builtin.ToolNameHandoff] = r.handleHandoff
 	r.toolMap[builtin.ToolNameChangeModel] = r.handleChangeModel
 	r.toolMap[builtin.ToolNameRevertModel] = r.handleRevertModel
+	r.toolMap[builtin.ToolNameRunSkill] = r.handleRunSkill
 
 	r.bgAgents.RegisterHandlers(func(name string, fn func(context.Context, *session.Session, tools.ToolCall) (*tools.ToolCallResult, error)) {
 		r.toolMap[name] = func(ctx context.Context, sess *session.Session, tc tools.ToolCall, _ chan Event) (*tools.ToolCallResult, error) {
@@ -53,7 +51,13 @@ func (r *LocalRuntime) finalizeEventChannel(ctx context.Context, sess *session.S
 
 	defer close(events)
 
-	events <- StreamStopped(sess.ID, r.resolveSessionAgent(sess).Name())
+	a := r.resolveSessionAgent(sess)
+
+	// Execute session end hooks with a context that won't be cancelled so
+	// cleanup hooks run even when the stream was interrupted (e.g. Ctrl+C).
+	r.executeSessionEndHooks(context.WithoutCancel(ctx), sess, a)
+
+	events <- StreamStopped(sess.ID, a.Name())
 
 	r.executeOnUserInputHooks(ctx, sess.ID, "stream stopped")
 
@@ -86,15 +90,11 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 
 		a := r.resolveSessionAgent(sess)
 
-		// Emit agent information for sidebar display
-		// Use getEffectiveModelID to account for active fallback cooldowns
-		events <- AgentInfo(a.Name(), r.getEffectiveModelID(a), a.Description(), a.WelcomeMessage())
+		// Execute session start hooks
+		r.executeSessionStartHooks(ctx, sess, a, events)
 
 		// Emit team information
 		events <- TeamInfo(r.agentDetailsFromTeam(), a.Name())
-
-		// Initialize RAG and forward events
-		r.InitializeRAG(ctx, events)
 
 		r.emitAgentWarnings(a, chanSend(events))
 		r.configureToolsetHandlers(a, events)
@@ -104,6 +104,7 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 			events <- Error(fmt.Sprintf("failed to get tools: %v", err))
 			return
 		}
+		agentTools = filterExcludedTools(agentTools, sess.ExcludedTools)
 
 		events <- ToolsetInfo(len(agentTools), false, a.Name())
 
@@ -117,11 +118,23 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 
 		defer r.finalizeEventChannel(ctx, sess, prevElicitationCh, events)
 
-		r.registerDefaultTools()
-
 		iteration := 0
 		// Use a runtime copy of maxIterations so we don't modify the session's persistent config
 		runtimeMaxIterations := sess.MaxIterations
+
+		// Initialize consecutive duplicate tool call detector
+		loopThreshold := sess.MaxConsecutiveToolCalls
+		if loopThreshold == 0 {
+			loopThreshold = 5 // default: always active
+		}
+		loopDetector := newToolLoopDetector(loopThreshold)
+
+		// overflowCompactions counts how many consecutive context-overflow
+		// auto-compactions have been attempted without a successful model
+		// call in between. This prevents an infinite loop when compaction
+		// cannot reduce the context below the model's limit.
+		const maxOverflowCompactions = 1
+		var overflowCompactions int
 
 		// toolModelOverride holds the per-toolset model from the most recent
 		// tool calls. It applies for one LLM turn, then resets.
@@ -146,6 +159,7 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				events <- Error(fmt.Sprintf("failed to get tools: %v", err))
 				return
 			}
+			agentTools = filterExcludedTools(agentTools, sess.ExcludedTools)
 
 			// Emit updated tool count. After a ToolListChanged MCP notification
 			// the cache is invalidated, so getTools above re-fetches from the
@@ -162,6 +176,10 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				)
 
 				events <- MaxIterationsReached(runtimeMaxIterations)
+
+				maxIterMsg := fmt.Sprintf("Maximum iterations reached (%d)", runtimeMaxIterations)
+				r.executeNotificationHooks(ctx, a, sess.ID, "warning", maxIterMsg)
+				r.executeOnUserInputHooks(ctx, sess.ID, "max iterations reached")
 
 				// Wait for user decision (resume / reject)
 				select {
@@ -210,7 +228,6 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 			))
 
 			model := a.Model()
-			defaultModelID := r.getEffectiveModelID(a)
 
 			// Per-tool model routing: use a cheaper model for this turn
 			// if the previous tool calls specified one, then reset.
@@ -226,20 +243,12 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				toolModelOverride = ""
 			}
 
-			// Apply thinking setting based on session state.
-			// When thinking is disabled: clone with thinking=false to clear any thinking config.
-			// When thinking is enabled: clone with thinking=true to ensure defaults are applied
-			// (this handles models with no thinking config, explicitly disabled thinking, or
-			// models that already have thinking configured).
-			model = provider.CloneWithOptions(ctx, model, options.WithThinking(sess.Thinking))
-			slog.Debug("Cloned provider with thinking setting", "agent", a.Name(), "model", model.ID(), "thinking", sess.Thinking)
-
 			modelID := model.ID()
 
-			// Notify sidebar when this turn uses a different model (per-tool override).
-			if modelID != defaultModelID {
-				events <- AgentInfo(a.Name(), modelID, a.Description(), a.WelcomeMessage())
-			}
+			// Notify sidebar of the model for this turn. For rule-based
+			// routing, the actual routed model is emitted from within the
+			// stream once the first chunk arrives.
+			events <- AgentInfo(a.Name(), modelID, a.Description(), a.WelcomeMessage())
 
 			slog.Debug("Using agent", "agent", a.Name(), "model", modelID)
 			slog.Debug("Getting model definition", "model_id", modelID)
@@ -248,13 +257,14 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				slog.Debug("Failed to get model definition", "error", err)
 			}
 
+			// We can only compact if we know the limit.
 			var contextLimit int64
 			if m != nil {
 				contextLimit = int64(m.Limit.Context)
-			}
 
-			if m != nil && r.sessionCompaction && compaction.ShouldCompact(sess.InputTokens, sess.OutputTokens, 0, contextLimit) {
-				r.Summarize(ctx, sess, "", events)
+				if r.sessionCompaction && compaction.ShouldCompact(sess.InputTokens, sess.OutputTokens, 0, contextLimit) {
+					r.Summarize(ctx, sess, "", events)
+				}
 			}
 
 			messages := sess.GetMessages(a)
@@ -280,13 +290,18 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				// Auto-recovery: if the error is a context overflow and
 				// session compaction is enabled, compact the conversation
 				// and retry the request instead of surfacing raw errors.
-				if _, ok := errors.AsType[*modelerrors.ContextOverflowError](err); ok && r.sessionCompaction {
+				// We allow at most maxOverflowCompactions consecutive attempts
+				// to avoid an infinite loop when compaction cannot reduce
+				// the context enough.
+				if _, ok := errors.AsType[*modelerrors.ContextOverflowError](err); ok && r.sessionCompaction && overflowCompactions < maxOverflowCompactions {
+					overflowCompactions++
 					slog.Warn("Context window overflow detected, attempting auto-compaction",
 						"agent", a.Name(),
 						"session_id", sess.ID,
 						"input_tokens", sess.InputTokens,
 						"output_tokens", sess.OutputTokens,
 						"context_limit", contextLimit,
+						"attempt", overflowCompactions,
 					)
 					events <- Warning(
 						"The conversation has exceeded the model's context window. Automatically compacting the conversation history...",
@@ -306,21 +321,19 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 				slog.Error("All models failed", "agent", a.Name(), "error", err)
 				// Track error in telemetry
 				telemetry.RecordError(ctx, err.Error())
-				events <- Error(modelerrors.FormatError(err))
+				errMsg := modelerrors.FormatError(err)
+				events <- Error(errMsg)
+				r.executeNotificationHooks(ctx, a, sess.ID, "error", errMsg)
 				streamSpan.End()
 				return
 			}
 
-			// Update sidebar model info to reflect what was actually used this turn.
-			// Fallback models are sticky (cooldown system persists them), so we only
-			// emit once. Per-tool model overrides are temporary (one turn), so we
-			// emit the override and then revert to the agent's default.
+			// A successful model call resets the overflow compaction counter.
+			overflowCompactions = 0
+
 			if usedModel != nil && usedModel.ID() != model.ID() {
 				slog.Info("Used fallback model", "agent", a.Name(), "primary", model.ID(), "used", usedModel.ID())
 				events <- AgentInfo(a.Name(), usedModel.ID(), a.Description(), a.WelcomeMessage())
-			} else if model.ID() != defaultModelID {
-				// Per-tool override was active: revert sidebar to the agent's default model.
-				events <- AgentInfo(a.Name(), defaultModelID, a.Description(), a.WelcomeMessage())
 			}
 			streamSpan.SetAttributes(
 				attribute.Int("tool.calls", len(res.Calls)),
@@ -342,11 +355,31 @@ func (r *LocalRuntime) RunStream(ctx context.Context, sess *session.Session) <-c
 
 			r.processToolCalls(ctx, sess, res.Calls, agentTools, events)
 
+			// Check for degenerate tool call loops
+			if loopDetector.record(res.Calls) {
+				toolName := "unknown"
+				if len(res.Calls) > 0 {
+					toolName = res.Calls[0].Function.Name
+				}
+				slog.Warn("Repetitive tool call loop detected",
+					"agent", a.Name(), "tool", toolName,
+					"consecutive", loopDetector.consecutive, "session_id", sess.ID)
+				errMsg := fmt.Sprintf(
+					"Agent terminated: detected %d consecutive identical calls to %s. "+
+						"This indicates a degenerate loop where the model is not making progress.",
+					loopDetector.consecutive, toolName)
+				events <- Error(errMsg)
+				r.executeNotificationHooks(ctx, a, sess.ID, "error", errMsg)
+				loopDetector.reset()
+				return
+			}
+
 			// Record per-toolset model override for the next LLM turn.
 			toolModelOverride = resolveToolCallModelOverride(res.Calls, agentTools)
 
 			if res.Stopped {
 				slog.Debug("Conversation stopped", "agent", a.Name())
+				r.executeStopHooks(ctx, sess, a, res.Content, events)
 				break
 			}
 
@@ -410,7 +443,7 @@ func (r *LocalRuntime) recordAssistantMessage(
 			float64(res.Usage.CacheWriteTokens)*m.Cost.CacheWrite) / 1e6
 	}
 
-	messageModel := cmp.Or(res.ActualModel, modelID)
+	messageModel := modelID
 
 	assistantMessage := chat.Message{
 		Role:              chat.MessageRoleAssistant,
@@ -424,6 +457,7 @@ func (r *LocalRuntime) recordAssistantMessage(
 		Usage:             res.Usage,
 		Model:             messageModel,
 		Cost:              messageCost,
+		FinishReason:      res.FinishReason,
 	}
 
 	addAgentMessage(sess, a, &assistantMessage, events)
@@ -434,12 +468,10 @@ func (r *LocalRuntime) recordAssistantMessage(
 		return nil
 	}
 	msgUsage := &MessageUsage{
-		Usage: *res.Usage,
-		Cost:  messageCost,
-		Model: messageModel,
-	}
-	if res.RateLimit != nil {
-		msgUsage.RateLimit = *res.RateLimit
+		Usage:        *res.Usage,
+		Cost:         messageCost,
+		Model:        messageModel,
+		FinishReason: res.FinishReason,
 	}
 	return msgUsage
 }
@@ -515,6 +547,11 @@ func (r *LocalRuntime) configureToolsetHandlers(a *agent.Agent, events chan Even
 			func() { events <- Authorization(tools.ElicitationActionAccept, a.Name()) },
 			r.managedOAuth,
 		)
+
+		// Wire RAG event forwarding so the TUI shows indexing progress.
+		if ragTool, ok := tools.As[*builtin.RAGTool](toolset); ok {
+			ragTool.SetEventCallback(ragEventForwarder(ragTool.Name(), r, chanSend(events)))
+		}
 	}
 }
 
@@ -538,7 +575,36 @@ func formatToolWarning(a *agent.Agent, warnings []string) string {
 	return strings.TrimSuffix(builder.String(), "\n")
 }
 
-// chanSend wraps a channel as a func(Event) for use with emitAgentWarnings.
+// filterExcludedTools removes tools whose names appear in the excluded list.
+// This is used by skill sub-sessions to prevent recursive run_skill calls.
+func filterExcludedTools(agentTools []tools.Tool, excluded []string) []tools.Tool {
+	if len(excluded) == 0 {
+		return agentTools
+	}
+	excludeSet := make(map[string]bool, len(excluded))
+	for _, name := range excluded {
+		excludeSet[name] = true
+	}
+	filtered := make([]tools.Tool, 0, len(agentTools))
+	for _, t := range agentTools {
+		if !excludeSet[t.Name] {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
+}
+
+// chanSend wraps a channel as a func(Event) for use with emitAgentWarnings
+// and RAG event forwarding. The send is non-blocking: if the channel is full
+// or closed, the event is silently dropped. This prevents a panic when a
+// long-lived goroutine (e.g. RAG file watcher) tries to forward an event
+// after the per-message events channel has been closed.
 func chanSend(ch chan Event) func(Event) {
-	return func(e Event) { ch <- e }
+	return func(e Event) {
+		defer func() { recover() }() //nolint:errcheck // swallow send-on-closed-channel panic
+		select {
+		case ch <- e:
+		default:
+		}
+	}
 }

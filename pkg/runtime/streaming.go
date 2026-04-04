@@ -28,9 +28,8 @@ type streamResult struct {
 	ThinkingSignature string
 	ThoughtSignature  []byte
 	Stopped           bool
-	ActualModel       string
+	FinishReason      chat.FinishReason
 	Usage             *chat.Usage
-	RateLimit         *chat.RateLimit
 }
 
 // handleStream reads a chat.MessageStream to completion, emitting streaming
@@ -45,9 +44,8 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 	var thinkingSignature string
 	var thoughtSignature []byte
 	var toolCalls []tools.ToolCall
-	var actualModel string
 	var messageUsage *chat.Usage
-	var messageRateLimit *chat.RateLimit
+	var providerFinishReason chat.FinishReason
 
 	toolCallIndex := make(map[string]int)   // toolCallID -> index in toolCalls slice
 	emittedPartial := make(map[string]bool) // toolCallID -> whether we've emitted a partial event
@@ -98,10 +96,6 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 			messageUsage = response.Usage
 		}
 
-		if response.RateLimit != nil {
-			messageRateLimit = response.RateLimit
-		}
-
 		if len(response.Choices) == 0 {
 			continue
 		}
@@ -109,11 +103,6 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 
 		if len(choice.Delta.ThoughtSignature) > 0 {
 			thoughtSignature = choice.Delta.ThoughtSignature
-		}
-
-		// Capture the actual model from the stream response (useful for model routing)
-		if actualModel == "" && response.Model != "" {
-			actualModel = response.Model
 		}
 
 		if choice.FinishReason == chat.FinishReasonStop || choice.FinishReason == chat.FinishReasonLength {
@@ -125,10 +114,16 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 				ThinkingSignature: thinkingSignature,
 				ThoughtSignature:  thoughtSignature,
 				Stopped:           true,
-				ActualModel:       actualModel,
+				FinishReason:      choice.FinishReason,
 				Usage:             messageUsage,
-				RateLimit:         messageRateLimit,
 			}, nil
+		}
+
+		// Track the provider's explicit finish reason (e.g. tool_calls) so we
+		// can prefer it over inference after the loop.  stop/length are already
+		// handled by the early return above.
+		if choice.FinishReason != "" {
+			providerFinishReason = choice.FinishReason
 		}
 
 		// Handle tool calls
@@ -161,10 +156,25 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 					tc.Function.Arguments += delta.Function.Arguments
 				}
 
-				// Emit PartialToolCall once we have a name, and on subsequent argument deltas
+				// Emit PartialToolCall once we have a name, and on subsequent argument deltas.
+				// Only the newly received argument bytes are sent, not the full
+				// accumulated arguments, to avoid re-transmitting the entire payload
+				// on every token.
 				if tc.Function.Name != "" && (learningName || delta.Function.Arguments != "") {
 					if !emittedPartial[delta.ID] || delta.Function.Arguments != "" {
-						events <- PartialToolCall(*tc, toolDefMap[tc.Function.Name], a.Name())
+						partial := tools.ToolCall{
+							ID:   tc.ID,
+							Type: tc.Type,
+							Function: tools.FunctionCall{
+								Name:      tc.Function.Name,
+								Arguments: delta.Function.Arguments,
+							},
+						}
+						toolDef := tools.Tool{}
+						if !emittedPartial[delta.ID] {
+							toolDef = toolDefMap[tc.Function.Name]
+						}
+						events <- PartialToolCall(partial, toolDef, a.Name())
 						emittedPartial[delta.ID] = true
 					}
 				}
@@ -193,6 +203,32 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 	// If the stream completed without producing any content or tool calls, likely because of a token limit, stop to avoid breaking the request loop
 	// NOTE(krissetto): this can likely be removed once compaction works properly with all providers (aka dmr)
 	stoppedDueToNoOutput := fullContent.Len() == 0 && len(toolCalls) == 0
+
+	// Prefer the provider's explicit finish reason when available (e.g.
+	// tool_calls).  Only fall back to inference when no explicit reason was
+	// received (stream ended with bare EOF):
+	//   - tool calls present        → tool_calls  (model was requesting tools)
+	//   - content but no tool calls → stop         (natural completion)
+	//   - no output at all          → null          (unknown; likely token limit)
+	finishReason := providerFinishReason
+	if finishReason == "" {
+		switch {
+		case len(toolCalls) > 0:
+			finishReason = chat.FinishReasonToolCalls
+		case fullContent.Len() > 0:
+			finishReason = chat.FinishReasonStop
+		default:
+			finishReason = chat.FinishReasonNull
+		}
+	}
+	// Ensure finish reason agrees with the actual stream output.
+	switch {
+	case finishReason == chat.FinishReasonToolCalls && len(toolCalls) == 0:
+		finishReason = chat.FinishReasonNull
+	case finishReason == chat.FinishReasonStop && len(toolCalls) > 0:
+		finishReason = chat.FinishReasonToolCalls
+	}
+
 	return streamResult{
 		Calls:             toolCalls,
 		Content:           fullContent.String(),
@@ -200,9 +236,8 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		ThinkingSignature: thinkingSignature,
 		ThoughtSignature:  thoughtSignature,
 		Stopped:           stoppedDueToNoOutput,
-		ActualModel:       actualModel,
+		FinishReason:      finishReason,
 		Usage:             messageUsage,
-		RateLimit:         messageRateLimit,
 	}, nil
 }
 

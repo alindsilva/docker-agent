@@ -8,18 +8,16 @@ import (
 	"maps"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/docker/docker-agent/pkg/agent"
+	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/types"
 	"github.com/docker/docker-agent/pkg/hooks"
 	"github.com/docker/docker-agent/pkg/modelsdev"
-	"github.com/docker/docker-agent/pkg/rag"
-	ragtypes "github.com/docker/docker-agent/pkg/rag/types"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/sessiontitle"
 	"github.com/docker/docker-agent/pkg/team"
@@ -163,12 +161,6 @@ type ModelStore interface {
 	GetDatabase(ctx context.Context) (*modelsdev.Database, error)
 }
 
-// RAGInitializer is implemented by runtimes that support background RAG initialization.
-// Local runtimes use this to start indexing early; remote runtimes typically do not.
-type RAGInitializer interface {
-	StartBackgroundRAGInit(ctx context.Context, sendEvent func(Event))
-}
-
 // ToolsChangeSubscriber is implemented by runtimes that can notify when
 // toolsets report a change in their tool list (e.g. after an MCP
 // ToolListChanged notification). The provided callback is invoked
@@ -192,7 +184,6 @@ type LocalRuntime struct {
 	elicitationRequestCh        chan ElicitationResult // Channel for receiving elicitation responses
 	elicitationEventsChannel    chan Event             // Current events channel for sending elicitation requests
 	elicitationEventsChannelMux sync.RWMutex           // Protects elicitationEventsChannel
-	ragInitialized              atomic.Bool
 	sessionStore                session.Store
 	workingDir                  string   // Working directory for hooks execution
 	env                         []string // Environment variables for hooks execution
@@ -338,107 +329,6 @@ func NewLocalRuntime(agents *team.Team, opts ...Opt) (*LocalRuntime, error) {
 	slog.Debug("Creating new runtime", "agent", r.currentAgent, "available_agents", agents.Size())
 
 	return r, nil
-}
-
-// StartBackgroundRAGInit initializes RAG in background and forwards events
-// Should be called early (e.g., by App) to start indexing before RunStream
-func (r *LocalRuntime) StartBackgroundRAGInit(ctx context.Context, sendEvent func(Event)) {
-	if r.ragInitialized.Swap(true) {
-		return
-	}
-
-	ragManagers := r.team.RAGManagers()
-	if len(ragManagers) == 0 {
-		return
-	}
-
-	slog.Debug("Starting background RAG initialization with event forwarding", "manager_count", len(ragManagers))
-
-	// Set up event forwarding BEFORE starting initialization
-	// This ensures all events are captured
-	r.forwardRAGEvents(ctx, ragManagers, sendEvent)
-
-	// Now start initialization (events will be forwarded)
-	r.team.InitializeRAG(ctx)
-	r.team.StartRAGFileWatchers(ctx)
-}
-
-// forwardRAGEvents forwards RAG manager events to the given callback
-// Consolidates duplicated event forwarding logic
-func (r *LocalRuntime) forwardRAGEvents(ctx context.Context, ragManagers map[string]*rag.Manager, sendEvent func(Event)) {
-	for _, mgr := range ragManagers {
-		go func(mgr *rag.Manager) {
-			ragName := mgr.Name()
-			slog.Debug("Starting RAG event forwarder goroutine", "rag", ragName)
-			for {
-				select {
-				case <-ctx.Done():
-					slog.Debug("RAG event forwarder stopped", "rag", ragName)
-					return
-				case ragEvent, ok := <-mgr.Events():
-					if !ok {
-						slog.Debug("RAG events channel closed", "rag", ragName)
-						return
-					}
-
-					agentName := r.CurrentAgentName()
-					slog.Debug("Forwarding RAG event", "type", ragEvent.Type, "rag", ragName, "agent", agentName)
-
-					switch ragEvent.Type {
-					case ragtypes.EventTypeIndexingStarted:
-						sendEvent(RAGIndexingStarted(ragName, ragEvent.StrategyName, agentName))
-					case ragtypes.EventTypeIndexingProgress:
-						if ragEvent.Progress != nil {
-							sendEvent(RAGIndexingProgress(ragName, ragEvent.StrategyName, ragEvent.Progress.Current, ragEvent.Progress.Total, agentName))
-						}
-					case ragtypes.EventTypeIndexingComplete:
-						sendEvent(RAGIndexingCompleted(ragName, ragEvent.StrategyName, agentName))
-					case ragtypes.EventTypeUsage:
-						// Convert RAG usage to TokenUsageEvent so TUI displays it
-						sendEvent(NewTokenUsageEvent("", agentName, &Usage{
-							InputTokens:   ragEvent.TotalTokens,
-							ContextLength: ragEvent.TotalTokens,
-							Cost:          ragEvent.Cost,
-						}))
-					case ragtypes.EventTypeError:
-						if ragEvent.Error != nil {
-							sendEvent(Error(fmt.Sprintf("RAG %s error: %v", ragName, ragEvent.Error)))
-						}
-					default:
-						// Log unhandled events for debugging
-						slog.Debug("Unhandled RAG event type", "type", ragEvent.Type, "rag", ragName)
-					}
-				}
-			}
-		}(mgr)
-	}
-}
-
-// InitializeRAG is called within RunStream as a fallback when background init wasn't used
-// (e.g., for exec command or API mode where there's no App)
-func (r *LocalRuntime) InitializeRAG(ctx context.Context, events chan Event) {
-	// If already initialized via StartBackgroundRAGInit, skip entirely
-	// Event forwarding was already set up there
-	if r.ragInitialized.Swap(true) {
-		slog.Debug("RAG already initialized, event forwarding already active", "manager_count", len(r.team.RAGManagers()))
-		return
-	}
-
-	ragManagers := r.team.RAGManagers()
-	if len(ragManagers) == 0 {
-		return
-	}
-
-	slog.Debug("Setting up RAG initialization (fallback path for non-TUI)", "manager_count", len(ragManagers))
-
-	// Set up event forwarding BEFORE starting initialization
-	r.forwardRAGEvents(ctx, ragManagers, func(event Event) {
-		events <- event
-	})
-
-	// Start initialization and file watchers
-	r.team.InitializeRAG(ctx)
-	r.team.StartRAGFileWatchers(ctx)
 }
 
 func (r *LocalRuntime) CurrentAgentName() string {
@@ -647,6 +537,114 @@ func (r *LocalRuntime) getHooksExecutor(a *agent.Agent) *hooks.Executor {
 		return nil
 	}
 	return hooks.NewExecutor(hooksCfg, r.workingDir, r.env)
+}
+
+// executeSessionStartHooks executes session start hooks for the given agent.
+// It logs the hook output as additional context and emits warnings for system messages.
+func (r *LocalRuntime) executeSessionStartHooks(ctx context.Context, sess *session.Session, a *agent.Agent, events chan Event) {
+	hooksExec := r.getHooksExecutor(a)
+	if hooksExec == nil || !hooksExec.HasSessionStartHooks() {
+		return
+	}
+
+	slog.Debug("Executing session start hooks", "agent", a.Name(), "session_id", sess.ID)
+	input := &hooks.Input{
+		SessionID: sess.ID,
+		Cwd:       r.workingDir,
+		Source:    "startup",
+	}
+
+	result, err := hooksExec.ExecuteSessionStart(ctx, input)
+	if err != nil {
+		slog.Warn("Session start hook execution failed", "agent", a.Name(), "error", err)
+		return
+	}
+
+	if result.SystemMessage != "" {
+		events <- Warning(result.SystemMessage, a.Name())
+	}
+	if result.AdditionalContext != "" {
+		slog.Debug("Session start hook provided additional context", "context", result.AdditionalContext)
+		sess.AddMessage(session.SystemMessage(result.AdditionalContext))
+	}
+}
+
+// executeSessionEndHooks executes session end hooks for the given agent.
+func (r *LocalRuntime) executeSessionEndHooks(ctx context.Context, sess *session.Session, a *agent.Agent) {
+	hooksExec := r.getHooksExecutor(a)
+	if hooksExec == nil || !hooksExec.HasSessionEndHooks() {
+		return
+	}
+
+	slog.Debug("Executing session end hooks", "agent", a.Name(), "session_id", sess.ID)
+	input := &hooks.Input{
+		SessionID: sess.ID,
+		Cwd:       r.workingDir,
+		Reason:    "stream_ended",
+	}
+
+	_, err := hooksExec.ExecuteSessionEnd(ctx, input)
+	if err != nil {
+		slog.Error("Session end hook execution failed", "agent", a.Name(), "error", err)
+	}
+}
+
+// executeStopHooks executes stop hooks when the model finishes responding.
+// The stop hook receives the model's final response content.
+func (r *LocalRuntime) executeStopHooks(ctx context.Context, sess *session.Session, a *agent.Agent, responseContent string, events chan Event) {
+	hooksExec := r.getHooksExecutor(a)
+	if hooksExec == nil || !hooksExec.HasStopHooks() {
+		return
+	}
+
+	slog.Debug("Executing stop hooks", "agent", a.Name(), "session_id", sess.ID)
+	input := &hooks.Input{
+		SessionID:    sess.ID,
+		Cwd:          r.workingDir,
+		StopResponse: responseContent,
+	}
+
+	result, err := hooksExec.ExecuteStop(ctx, input)
+	if err != nil {
+		slog.Warn("Stop hook execution failed", "agent", a.Name(), "error", err)
+		return
+	}
+
+	if result.SystemMessage != "" {
+		events <- Warning(result.SystemMessage, a.Name())
+	}
+}
+
+// executeNotificationHooks executes notification hooks when the agent emits a user-facing
+// notification (e.g., errors or warnings). Hook output is logged but does not affect the
+// notification itself. Individual hooks are subject to their configured timeout.
+func (r *LocalRuntime) executeNotificationHooks(ctx context.Context, a *agent.Agent, sessionID, level, message string) {
+	if a == nil {
+		return
+	}
+
+	if level != "error" && level != "warning" {
+		slog.Error("Invalid notification level", "level", level, "expected", "error|warning")
+		return
+	}
+
+	hooksExec := r.getHooksExecutor(a)
+	if hooksExec == nil || !hooksExec.HasNotificationHooks() {
+		return
+	}
+
+	slog.Debug("Executing notification hooks", "level", level, "session_id", sessionID)
+	input := &hooks.Input{
+		SessionID:           sessionID,
+		Cwd:                 r.workingDir,
+		NotificationLevel:   level,
+		NotificationMessage: message,
+	}
+
+	_, err := hooksExec.ExecuteNotification(ctx, input)
+	if err != nil {
+		slog.Warn("Notification hook execution failed", "error", err)
+	}
 }
 
 // executeOnUserInputHooks executes on-user-input hooks for the current agent
@@ -864,6 +862,32 @@ func (r *LocalRuntime) EmitStartupInfo(ctx context.Context, sess *session.Sessio
 		}
 		usage := SessionUsage(sess, contextLimit)
 		usage.Cost = sess.TotalCost()
+
+		// Reconstruct LastMessage from the parent session's last assistant
+		// message so that FinishReason (and other per-message fields) are
+		// available on session restore.  We intentionally iterate
+		// sess.Messages (not GetAllMessages) so the result reflects the
+		// parent agent's state: this event carries the parent session_id,
+		// and sub-agents emit their own token_usage events with their own
+		// session_id during live streaming.
+		for i := len(sess.Messages) - 1; i >= 0; i-- {
+			item := &sess.Messages[i]
+			if !item.IsMessage() || item.Message.Message.Role != chat.MessageRoleAssistant {
+				continue
+			}
+			msg := &item.Message.Message
+			lm := &MessageUsage{
+				Model:        msg.Model,
+				Cost:         msg.Cost,
+				FinishReason: msg.FinishReason,
+			}
+			if msg.Usage != nil {
+				lm.Usage = *msg.Usage
+			}
+			usage.LastMessage = lm
+			break
+		}
+
 		send(NewTokenUsageEvent(sess.ID, r.CurrentAgentName(), usage))
 	}
 

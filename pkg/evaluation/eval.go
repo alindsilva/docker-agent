@@ -32,16 +32,16 @@ import (
 // Runner runs evaluations against an agent.
 type Runner struct {
 	Config
+
 	agentSource config.Source
 	judge       *Judge
 	runConfig   *config.RuntimeConfig
 
-	// imageCache caches built Docker images by working directory.
-	// Key is the working directory (empty string for no working dir).
-	imageCache   map[string]string
+	// imageCache caches built Docker images by (workingDir, image) pair.
+	imageCache   map[imageKey]string
 	imageCacheMu sync.Mutex
 
-	// imageBuildGroup deduplicates concurrent image builds for the same working directory.
+	// imageBuildGroup deduplicates concurrent image builds for the same (workingDir, image) pair.
 	imageBuildGroup singleflight.Group
 }
 
@@ -49,14 +49,14 @@ type Runner struct {
 func newRunner(agentSource config.Source, runConfig *config.RuntimeConfig, judgeModel provider.Provider, cfg Config) *Runner {
 	var judge *Judge
 	if judgeModel != nil {
-		judge = NewJudge(judgeModel, runConfig, cfg.Concurrency)
+		judge = NewJudge(judgeModel, cfg.Concurrency)
 	}
 	return &Runner{
 		Config:      cfg,
 		agentSource: agentSource,
 		judge:       judge,
 		runConfig:   runConfig,
-		imageCache:  make(map[string]string),
+		imageCache:  make(map[imageKey]string),
 	}
 }
 
@@ -90,6 +90,7 @@ func Evaluate(ctx context.Context, ttyOut, out io.Writer, isTTY bool, runName st
 		Name:      runName,
 		Timestamp: startTime,
 		Duration:  duration,
+		Config:    cfg,
 		Results:   results,
 		Summary:   summary,
 	}
@@ -115,6 +116,20 @@ func (r *Runner) Run(ctx context.Context, ttyOut, out io.Writer, isTTY bool) ([]
 	evals, err := r.loadEvalSessions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("loading evaluations: %w", err)
+	}
+
+	// Check whether any evaluations require relevance checking.
+	// If so, the judge must be configured and working; validate eagerly
+	// to fail fast on configuration issues (bad API key, wrong model, etc.)
+	// instead of silently producing zero-relevance results.
+	if needsJudge(evals) {
+		if r.judge == nil {
+			return nil, errors.New("some evaluations have relevance criteria but no judge model is configured (use --judge-model)")
+		}
+		fmt.Fprintln(out, "Validating judge model...")
+		if err := r.judge.Validate(ctx); err != nil {
+			return nil, fmt.Errorf("%w", err)
+		}
 	}
 
 	// Pre-build all unique Docker images in parallel before running evaluations.
@@ -216,63 +231,68 @@ func (r *Runner) loadEvalSessions(ctx context.Context) ([]InputSession, error) {
 }
 
 // preBuildImages pre-builds all unique Docker images needed for the evaluations.
-// This is done in parallel to avoid serialized builds during evaluation.
+// Concurrent calls for the same (workingDir, image) pair are deduplicated by
+// getOrBuildImage's singleflight, so we simply iterate over all evals.
 func (r *Runner) preBuildImages(ctx context.Context, out io.Writer, evals []InputSession) error {
-	// Collect unique working directories
-	workingDirs := make(map[string]struct{})
-	for _, eval := range evals {
-		if eval.Evals != nil {
-			workingDirs[eval.Evals.WorkingDir] = struct{}{}
-		}
-	}
-
-	if len(workingDirs) == 0 {
+	if len(evals) == 0 {
 		return nil
 	}
 
-	fmt.Fprintf(out, "Pre-building %d Docker image(s)...\n", len(workingDirs))
-
-	// Build images in parallel with limited concurrency
-	type buildResult struct {
-		workingDir string
-		err        error
+	// Count unique images to report an accurate number.
+	unique := make(map[imageKey]struct{})
+	for _, eval := range evals {
+		var key imageKey
+		if eval.Evals != nil {
+			key = imageKey{workingDir: eval.Evals.WorkingDir, image: eval.Evals.Image}
+		}
+		unique[key] = struct{}{}
 	}
 
-	work := make(chan string, len(workingDirs))
-	for wd := range workingDirs {
-		work <- wd
+	fmt.Fprintf(out, "Pre-building %d Docker image(s)...\n", len(unique))
+
+	type buildResult struct {
+		title string
+		err   error
+	}
+
+	work := make(chan InputSession, len(evals))
+	for _, eval := range evals {
+		work <- eval
 	}
 	close(work)
 
-	results := make(chan buildResult, len(workingDirs))
+	results := make(chan buildResult, len(evals))
 
-	// Use same concurrency as evaluation runs for image builds
-	buildWorkers := min(r.Concurrency, len(workingDirs))
+	buildWorkers := min(r.Concurrency, len(evals))
 	var wg sync.WaitGroup
 	for range buildWorkers {
 		wg.Go(func() {
-			for wd := range work {
+			for eval := range work {
 				if ctx.Err() != nil {
-					results <- buildResult{workingDir: wd, err: ctx.Err()}
+					results <- buildResult{title: eval.Title, err: ctx.Err()}
 					continue
 				}
-				_, err := r.getOrBuildImage(ctx, wd)
-				results <- buildResult{workingDir: wd, err: err}
+
+				criteria := eval.Evals
+				if criteria == nil {
+					criteria = &session.EvalCriteria{}
+				}
+
+				_, err := r.getOrBuildImage(ctx, criteria)
+				results <- buildResult{title: eval.Title, err: err}
 			}
 		})
 	}
 
-	// Wait for all builds to complete
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect errors
 	var errs []error
 	for result := range results {
 		if result.err != nil {
-			errs = append(errs, fmt.Errorf("building image for %q: %w", result.workingDir, result.err))
+			errs = append(errs, fmt.Errorf("building image for %q: %w", result.title, result.err))
 		}
 	}
 
@@ -309,9 +329,7 @@ func (r *Runner) runSingleEval(ctx context.Context, evalSess *InputSession) (Res
 		result.ToolCallsExpected = 1.0
 	}
 
-	workingDir := evals.WorkingDir
-
-	imageID, err := r.getOrBuildImage(ctx, workingDir)
+	imageID, err := r.getOrBuildImage(ctx, evals)
 	if err != nil {
 		return result, fmt.Errorf("building eval image: %w", err)
 	}
@@ -336,17 +354,21 @@ func (r *Runner) runSingleEval(ctx context.Context, evalSess *InputSession) (Res
 		result.ToolCallsScore = toolCallF1Score(expectedToolCalls, actualToolCalls)
 	}
 
-	result.HandoffsMatch = countHandoffs(expectedToolCalls) == countHandoffs(actualToolCalls)
-
 	if r.judge != nil && len(evals.Relevance) > 0 {
 		// Use transcript for relevance checking to preserve temporal ordering
 		transcript := buildTranscript(events)
-		passed, failed, errs := r.judge.CheckRelevance(ctx, transcript, evals.Relevance)
-		result.RelevancePassed = float64(passed)
-		result.FailedRelevance = failed
-		for _, e := range errs {
-			slog.Warn("Relevance check error", "title", evalSess.Title, "error", e)
+		results, err := r.judge.CheckRelevance(ctx, transcript, evals.Relevance)
+		if err != nil {
+			return result, fmt.Errorf("relevance check failed: %w", err)
 		}
+		var passed float64
+		for _, rr := range results {
+			if rr.Passed {
+				passed++
+			}
+		}
+		result.RelevancePassed = passed
+		result.RelevanceResults = results
 	}
 
 	slog.Debug("Evaluation complete", "title", evalSess.Title, "duration", time.Since(startTime))
@@ -374,13 +396,6 @@ func (r *Runner) runDockerAgentInContainer(ctx context.Context, imageID string, 
 
 	var env []string
 
-	for _, name := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "NEBIUS_API_KEY"} {
-		if val, ok := r.runConfig.EnvProvider().Get(ctx, name); ok && val != "" {
-			args = append(args, "-e", name)
-			env = append(env, name+"="+val)
-		}
-	}
-
 	if r.runConfig.ModelsGateway != "" {
 		args = append(args, "-e", "DOCKER_AGENT_MODELS_GATEWAY")
 		env = append(env, "DOCKER_AGENT_MODELS_GATEWAY="+r.runConfig.ModelsGateway)
@@ -388,6 +403,13 @@ func (r *Runner) runDockerAgentInContainer(ctx context.Context, imageID string, 
 		if token, ok := r.runConfig.EnvProvider().Get(ctx, environment.DockerDesktopTokenEnv); ok && token != "" {
 			args = append(args, "-e", environment.DockerDesktopTokenEnv)
 			env = append(env, environment.DockerDesktopTokenEnv+"="+token)
+		}
+	} else {
+		for _, name := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "XAI_API_KEY", "NEBIUS_API_KEY"} {
+			if val, ok := r.runConfig.EnvProvider().Get(ctx, name); ok && val != "" {
+				args = append(args, "-e", name)
+				env = append(env, name+"="+val)
+			}
 		}
 	}
 
@@ -560,7 +582,12 @@ func buildTranscript(events []map[string]any) string {
 			fmt.Fprintf(&transcript, "[Agent %s calls tool %q with arguments: %s]\n\n", cmp.Or(currentAgent, "unknown"), name, args)
 
 		case "tool_call_response":
-			name, _ := getToolCallInfo(event)
+			// The ToolCallResponseEvent has tool_definition at the top level, not
+			// nested under "tool_call".
+			var name string
+			if td, ok := event["tool_definition"].(map[string]any); ok {
+				name, _ = td["name"].(string)
+			}
 			response, _ := event["response"].(string)
 			if len(response) > 500 {
 				response = response[:500] + "...(truncated)"
@@ -590,6 +617,14 @@ func matchesAnyPattern(name string, patterns []string) bool {
 	})
 }
 
+// needsJudge returns true if any evaluation session has relevance criteria,
+// meaning a judge model is required to evaluate them.
+func needsJudge(evals []InputSession) bool {
+	return slices.ContainsFunc(evals, func(s InputSession) bool {
+		return s.Evals != nil && len(s.Evals.Relevance) > 0
+	})
+}
+
 // createJudgeModel creates a provider.Provider from a model string (format: provider/model).
 // Returns nil if judgeModel is empty.
 func createJudgeModel(ctx context.Context, judgeModel string, runConfig *config.RuntimeConfig) (provider.Provider, error) {
@@ -602,7 +637,9 @@ func createJudgeModel(ctx context.Context, judgeModel string, runConfig *config.
 		return nil, fmt.Errorf("invalid judge model format %q: expected 'provider/model'", judgeModel)
 	}
 
-	var opts []options.Opt
+	opts := []options.Opt{
+		options.WithStructuredOutput(judgeResponseSchema),
+	}
 	if runConfig.ModelsGateway != "" {
 		opts = append(opts, options.WithGateway(runConfig.ModelsGateway))
 	}

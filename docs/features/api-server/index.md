@@ -49,7 +49,6 @@ All endpoints are under the `/api` prefix.
 | `PATCH`  | `/api/sessions/:id/permissions`     | Update session permissions                          |
 | `POST`   | `/api/sessions/:id/resume`          | Resume a paused session (after tool confirmation)   |
 | `POST`   | `/api/sessions/:id/tools/toggle`    | Toggle auto-approve (YOLO) mode                     |
-| `POST`   | `/api/sessions/:id/thinking/toggle` | Toggle thinking/reasoning mode                      |
 | `POST`   | `/api/sessions/:id/elicitation`     | Respond to an MCP tool elicitation request          |
 
 ### Agent Execution
@@ -59,6 +58,34 @@ All endpoints are under the `/api` prefix.
 | `POST` | `/api/sessions/:id/agent/:agent`       | Run the root agent for a session (SSE stream) |
 | `POST` | `/api/sessions/:id/agent/:agent/:name` | Run a specific named agent (SSE stream)       |
 
+**Path parameters:**
+
+- **`:agent`** — The agent identifier, which is the **config filename without the `.yaml` extension**. This must match the filename passed to `docker agent serve api`. For example, if you start the server with `docker agent serve api my-assistant.yaml`, the agent identifier is `my-assistant`. When serving a directory of YAML files, each file becomes a separate agent identified by its filename without the extension.
+- **`:name`** _(optional)_ — The name of a specific sub-agent defined in a multi-agent configuration. If omitted, the request targets the `root` agent. For example, in a config that defines agents named `root`, `coder`, and `reviewer`, use `/api/sessions/:id/agent/my-config/coder` to run the `coder` sub-agent directly.
+
+**Examples:**
+
+```bash
+# Single-agent config: my-assistant.yaml
+# Start: docker agent serve api my-assistant.yaml
+# Run the root agent:
+curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/my-assistant \
+  -H "Content-Type: application/json" \
+  -d '[{"role": "user", "content": "Hello!"}]'
+
+# Multi-agent config: team.yaml (defines agents: root, coder, reviewer)
+# Start: docker agent serve api team.yaml
+# Run the root agent:
+curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/team \
+  -H "Content-Type: application/json" \
+  -d '[{"role": "user", "content": "Review this PR"}]'
+
+# Run a specific sub-agent (reviewer):
+curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/team/reviewer \
+  -H "Content-Type: application/json" \
+  -d '[{"role": "user", "content": "Review this PR"}]'
+```
+
 ### Health
 
 | Method | Path        | Description                               |
@@ -67,10 +94,11 @@ All endpoints are under the `/api` prefix.
 
 ## Streaming Responses
 
-The agent execution endpoints (`POST /api/sessions/:id/agent/:agent`) return **Server-Sent Events (SSE)**. Each event is a JSON object representing a runtime event:
+The agent execution endpoints (`POST /api/sessions/:id/agent/:agent`) return **Server-Sent Events (SSE)**. Each event is a JSON object representing a runtime event (remember that `:agent` is the config filename without the `.yaml` extension):
 
 ```bash
 # Send a message and stream the response
+# (assuming the server was started with: docker agent serve api my-agent.yaml)
 $ curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/my-agent \
   -H "Content-Type: application/json" \
   -d '[{"role": "user", "content": "Hello!"}]'
@@ -131,7 +159,7 @@ docker agent serve api <agent-file>|<agents-dir> [flags]
 | `--fake`           | (none)           | Replay AI responses from cassette file (testing) |
 | `--record`         | (none)           | Record AI API interactions to cassette file      |
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Multi-agent configs
 </div>
   <p>You can point <code>docker agent serve api</code> at a directory containing multiple agent YAML files. Each becomes a separate agent accessible via <code>/api/agents</code>. Combine with <code>--pull-interval</code> to auto-refresh agents from an OCI registry.</p>
@@ -156,7 +184,7 @@ By default, tool calls require approval. In the API workflow:
 
 Toggle auto-approve with `POST /api/sessions/:id/tools/toggle` for automated workflows.
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ See also
 </div>
   <p>For interactive use, see the <a href="{{ '/features/tui/' | relative_url }}">Terminal UI</a>. For agent-to-agent communication, see <a href="{{ '/features/a2a/' | relative_url }}">A2A Protocol</a> and <a href="{{ '/features/acp/' | relative_url }}">ACP</a>. For MCP integration, see <a href="{{ '/features/mcp-mode/' | relative_url }}">MCP Mode</a>.</p>

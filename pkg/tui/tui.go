@@ -103,8 +103,6 @@ type appModel struct {
 	wWidth, wHeight int
 	width, height   int
 
-	cancelThinkingCheck context.CancelFunc // cancels the in-flight thinking toggle check
-
 	// Content area height (height minus editor, tab bar, resize handle, status bar)
 	contentHeight int
 
@@ -158,10 +156,24 @@ type appModel struct {
 
 	ready bool
 	err   error
+
+	// leanMode enables a simplified TUI with minimal chrome.
+	leanMode bool
+}
+
+// Option configures the TUI.
+type Option func(*appModel)
+
+// WithLeanMode enables a simplified TUI with minimal chrome:
+// no sidebar, no tab bar, no overlays, no resize handle.
+func WithLeanMode() Option {
+	return func(m *appModel) {
+		m.leanMode = true
+	}
 }
 
 // New creates a new Model.
-func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initialWorkingDir string, cleanup func()) tea.Model {
+func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initialWorkingDir string, cleanup func(), opts ...Option) tea.Model {
 	// Initialize supervisor
 	sv := supervisor.New(spawner)
 
@@ -184,7 +196,6 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 	}
 
 	initialSessionState := service.NewSessionState(initialApp.Session())
-	initialChatPage := chat.New(initialApp, initialSessionState)
 	initialEditor := editor.New(initialApp, historyStore)
 	sessID := initialApp.Session().ID
 
@@ -192,12 +203,11 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 		supervisor:              sv,
 		tabBar:                  tb,
 		tuiStore:                ts,
-		chatPages:               map[string]chat.Page{sessID: initialChatPage},
+		chatPages:               map[string]chat.Page{},
 		sessionStates:           map[string]*service.SessionState{sessID: initialSessionState},
 		editors:                 map[string]editor.Editor{sessID: initialEditor},
 		application:             initialApp,
 		sessionState:            initialSessionState,
-		chatPage:                initialChatPage,
 		editor:                  initialEditor,
 		history:                 historyStore,
 		pendingRestores:         make(map[string]string),
@@ -211,6 +221,16 @@ func New(ctx context.Context, spawner SessionSpawner, initialApp *app.App, initi
 		editorLines:             3,
 		dockerDesktop:           os.Getenv("TERM_PROGRAM") == "docker_desktop",
 	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	// Create initial chat page (after options are applied so leanMode is set)
+	initialChatPage := chat.New(initialApp, initialSessionState, m.chatPageOpts()...)
+	m.chatPages[sessID] = initialChatPage
+	m.chatPage = initialChatPage
 
 	// Initialize status bar (pass m as help provider)
 	m.statusBar = statusbar.New(m)
@@ -260,12 +280,22 @@ func (m *appModel) reapplyKeyboardEnhancements() {
 	m.editor = editorModel.(editor.Editor)
 }
 
+// chatPageOpts returns the chat.PageOption slice derived from the current
+// appModel configuration (e.g. lean mode).
+func (m *appModel) chatPageOpts() []chat.PageOption {
+	var opts []chat.PageOption
+	if m.leanMode {
+		opts = append(opts, chat.WithLeanMode())
+	}
+	return opts
+}
+
 // initSessionComponents creates a new chat page, session state, and editor for
 // the given app and stores them in the per-session maps under tabID. The active
 // convenience pointers (m.chatPage, m.sessionState, m.editor) are also updated.
 func (m *appModel) initSessionComponents(tabID string, a *app.App, sess *session.Session) {
 	ss := service.NewSessionState(sess)
-	cp := chat.New(a, ss)
+	cp := chat.New(a, ss, m.chatPageOpts()...)
 	ed := editor.New(a, m.history)
 
 	m.chatPages[tabID] = cp
@@ -448,6 +478,16 @@ func (m *appModel) Init() tea.Cmd {
 
 // Update handles messages.
 func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// In lean mode, silently drop messages for features that don't exist.
+	if m.leanMode {
+		switch msg.(type) {
+		case messages.SpawnSessionMsg, messages.SwitchTabMsg,
+			messages.CloseTabMsg, messages.ReorderTabMsg,
+			messages.ToggleSidebarMsg:
+			return m, nil
+		}
+	}
+
 	switch msg := msg.(type) {
 	// --- Routing & Animation ---
 
@@ -704,6 +744,10 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// /new spawns a new tab when a session spawner is configured.
 		return m.handleSpawnSession("")
 
+	case messages.ClearSessionMsg:
+		// /clear resets the current tab with a fresh session in the same working dir.
+		return m.handleClearSession()
+
 	// --- Exit ---
 
 	case messages.ExitSessionMsg:
@@ -755,12 +799,6 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case messages.ToggleYoloMsg:
 		return m.handleToggleYolo()
 
-	case messages.ToggleThinkingMsg:
-		return m.handleToggleThinking()
-
-	case messages.ToggleThinkingResultMsg:
-		return m.handleToggleThinkingResult(msg)
-
 	case messages.ToggleHideToolResultsMsg:
 		return m.handleToggleHideToolResults()
 
@@ -809,6 +847,9 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case messages.ShowPermissionsDialogMsg:
 		return m.handleShowPermissionsDialog()
+
+	case messages.ShowToolsDialogMsg:
+		return m.handleShowToolsDialog()
 
 	case messages.AgentCommandMsg:
 		return m.handleAgentCommand(msg.Command)
@@ -1088,10 +1129,7 @@ func (m *appModel) replaceActiveSession(ctx context.Context, sess *session.Sessi
 
 	slog.Debug("Replacing empty session in-place", "tab_id", activeID, "loaded_session", sess.ID)
 
-	// Cleanup old chat page and editor for the active session
-	if cp, ok := m.chatPages[activeID]; ok {
-		cp.Cleanup()
-	}
+	// Cleanup old editor for the active session
 	if ed, ok := m.editors[activeID]; ok {
 		ed.Cleanup()
 	}
@@ -1125,6 +1163,46 @@ func (m *appModel) replaceActiveSession(ctx context.Context, sess *session.Sessi
 
 	cmd := m.initAndFocusComponents()
 	return m, cmd
+}
+
+// handleClearSession resets the current tab by creating a fresh session
+// in the same working directory.
+func (m *appModel) handleClearSession() (tea.Model, tea.Cmd) {
+	activeID := m.supervisor.ActiveID()
+
+	// Cleanup old editor for the active session.
+	if ed, ok := m.editors[activeID]; ok {
+		ed.Cleanup()
+	}
+
+	// Create a fresh session in the same app, preserving the working dir.
+	m.application.NewSession()
+	newSess := m.application.Session()
+
+	// Rebuild all per-session UI components.
+	m.initSessionComponents(activeID, m.application, newSess)
+	m.dialogMgr = dialog.New()
+	m.supervisor.SetRunnerTitle(activeID, "")
+	m.sessionState.SetSessionTitle("")
+	m.sessionState.SetPreviousMessage(nil)
+
+	// Update persisted tab to point to the new session.
+	if m.tuiStore != nil {
+		ctx := context.Background()
+		oldPersistedID := m.persistedSessionID(activeID)
+		if err := m.tuiStore.UpdateTabSessionID(ctx, oldPersistedID, newSess.ID); err != nil {
+			slog.Warn("Failed to update tab session ID after clear", "error", err)
+		}
+	}
+	m.persistActiveTab(newSess.ID)
+
+	m.reapplyKeyboardEnhancements()
+
+	return m, tea.Sequence(
+		m.chatPage.Init(),
+		m.resizeAll(),
+		m.editor.Focus(),
+	)
 }
 
 // handleSpawnSession spawns a new session.
@@ -1361,10 +1439,7 @@ func (m *appModel) handleCloseTab(sessionID string) (tea.Model, tea.Cmd) {
 	nextActiveID := m.supervisor.CloseSession(sessionID)
 
 	// Clean up per-session state
-	if cp, ok := m.chatPages[sessionID]; ok {
-		cp.Cleanup()
-		delete(m.chatPages, sessionID)
-	}
+	delete(m.chatPages, sessionID)
 	if ed, ok := m.editors[sessionID]; ok {
 		ed.Cleanup()
 		delete(m.editors, sessionID)
@@ -1428,14 +1503,19 @@ func (m *appModel) resizeAll() tea.Cmd {
 	var cmds []tea.Cmd
 
 	width, height := m.width, m.height
+	innerWidth := width - appPaddingHorizontal
 
-	// Calculate fixed heights
-	tabBarHeight := m.tabBar.Height()
-	statusBarHeight := m.statusBar.Height()
-	resizeHandleHeight := 1
+	// Calculate chrome height (everything that isn't content or editor)
+	chromeHeight := 0
+	if m.leanMode {
+		if m.chatPage.IsWorking() {
+			chromeHeight = 1 // working indicator line
+		}
+	} else {
+		chromeHeight = m.tabBar.Height() + m.statusBar.Height() + 1 // +1 for resize handle
+	}
 
 	// Calculate editor height
-	innerWidth := width - appPaddingHorizontal
 	minLines := 4
 	maxLines := max(minLines, (height-6)/2)
 	m.editorLines = max(minLines, min(m.editorLines, maxLines))
@@ -1448,22 +1528,21 @@ func (m *appModel) resizeAll() tea.Cmd {
 	editorRenderedHeight := editorHeight + 1
 
 	// Content gets remaining space
-	m.contentHeight = max(1, height-tabBarHeight-statusBarHeight-resizeHandleHeight-editorRenderedHeight)
+	m.contentHeight = max(1, height-chromeHeight-editorRenderedHeight)
+	cmds = append(cmds, m.chatPage.SetSize(width, m.contentHeight))
 
-	// Update dialog (uses full window dimensions for overlay positioning)
+	if m.leanMode {
+		return tea.Batch(cmds...)
+	}
+
+	// Full mode: update overlay components
 	u, cmd := m.dialogMgr.Update(tea.WindowSizeMsg{Width: width, Height: height})
 	m.dialogMgr = u.(dialog.Manager)
 	cmds = append(cmds, cmd)
 
-	// Update chat page (content area)
-	cmd = m.chatPage.SetSize(width, m.contentHeight)
-	cmds = append(cmds, cmd)
-
-	// Update completion manager with editor height for popup positioning
-	m.completions.SetEditorBottom(editorHeight + tabBarHeight)
+	m.completions.SetEditorBottom(editorHeight + m.tabBar.Height())
 	m.completions.Update(tea.WindowSizeMsg{Width: width, Height: height})
 
-	// Update notification
 	m.notification.SetSize(width, height)
 
 	return tea.Batch(cmds...)
@@ -1474,12 +1553,17 @@ func (m *appModel) Help() help.KeyMap {
 	return core.NewSimpleHelp(m.Bindings())
 }
 
-// Bindings returns the key bindings shown in the status bar.
-func (m *appModel) Bindings() []key.Binding {
+// AllBindings returns ALL available key bindings for the help dialog (comprehensive list).
+func (m *appModel) AllBindings() []key.Binding {
 	quitBinding := key.NewBinding(
 		key.WithKeys("ctrl+c"),
 		key.WithHelp("Ctrl+c", "quit"),
 	)
+
+	if m.leanMode {
+		return []key.Binding{quitBinding}
+	}
+
 	tabBinding := key.NewBinding(
 		key.WithKeys("tab"),
 		key.WithHelp("Tab", "switch focus"),
@@ -1488,10 +1572,48 @@ func (m *appModel) Bindings() []key.Binding {
 	bindings := []key.Binding{quitBinding, tabBinding}
 	bindings = append(bindings, m.tabBar.Bindings()...)
 
-	bindings = append(bindings, key.NewBinding(
-		key.WithKeys("ctrl+k"),
-		key.WithHelp("Ctrl+k", "commands"),
-	))
+	// Additional global shortcuts
+	bindings = append(bindings,
+		key.NewBinding(
+			key.WithKeys("ctrl+k"),
+			key.WithHelp("Ctrl+k", "commands"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+h"),
+			key.WithHelp("Ctrl+h", "help"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+y"),
+			key.WithHelp("Ctrl+y", "toggle yolo mode"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+o"),
+			key.WithHelp("Ctrl+o", "toggle hide tool results"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+s"),
+			key.WithHelp("Ctrl+s", "cycle agent"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+m"),
+			key.WithHelp("Ctrl+m", "model picker"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+x"),
+			key.WithHelp("Ctrl+x", "clear queue"),
+		),
+		key.NewBinding(
+			key.WithKeys("ctrl+z"),
+			key.WithHelp("Ctrl+z", "suspend"),
+		),
+	)
+
+	if !m.leanMode {
+		bindings = append(bindings, key.NewBinding(
+			key.WithKeys("ctrl+b"),
+			key.WithHelp("Ctrl+b", "toggle sidebar"),
+		))
+	}
 
 	// Show newline help based on keyboard enhancement support
 	if m.keyboardEnhancementsSupported {
@@ -1524,6 +1646,47 @@ func (m *appModel) Bindings() []key.Binding {
 	return bindings
 }
 
+// Bindings returns the key bindings shown in the status bar (a curated subset).
+// This filters AllBindings() to show only the most essential commands.
+func (m *appModel) Bindings() []key.Binding {
+	all := m.AllBindings()
+
+	// Define which keys should appear in the status bar
+	statusBarKeys := map[string]bool{
+		"ctrl+c":      true, // quit
+		"tab":         true, // switch focus
+		"ctrl+t":      true, // new tab (from tabBar)
+		"ctrl+w":      true, // close tab (from tabBar)
+		"ctrl+p":      true, // prev tab (from tabBar)
+		"ctrl+n":      true, // next tab (from tabBar)
+		"ctrl+k":      true, // commands
+		"ctrl+h":      true, // help
+		"shift+enter": true, // newline
+		"ctrl+j":      true, // newline fallback
+		"ctrl+g":      true, // edit in external editor (editor context)
+		"ctrl+r":      true, // history search (editor context)
+		// Content panel bindings (↑↓, c, e, d) are always included
+		"up":   true,
+		"down": true,
+		"c":    true,
+		"e":    true,
+		"d":    true,
+	}
+
+	// Filter to only include status bar keys
+	var filtered []key.Binding
+	for _, binding := range all {
+		if len(binding.Keys()) > 0 {
+			bindingKey := binding.Keys()[0]
+			if statusBarKeys[bindingKey] {
+				filtered = append(filtered, binding)
+			}
+		}
+	}
+
+	return filtered
+}
+
 // handleKeyPress handles all keyboard input with proper priority routing.
 func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Check if we should stop transcription on Enter or Escape
@@ -1548,7 +1711,7 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	// Tab bar keys (Ctrl+t, Ctrl+p, Ctrl+n, Ctrl+w) are suppressed during
 	// history search so that ctrl+n/ctrl+p cycle through matches instead.
-	if !m.editor.IsHistorySearchActive() {
+	if !m.leanMode && !m.editor.IsHistorySearchActive() {
 		if cmd := m.tabBar.Update(msg); cmd != nil {
 			return m, cmd
 		}
@@ -1603,6 +1766,12 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+x"))):
 		return m, core.CmdHandler(messages.ClearQueueMsg{})
+
+	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+h", "f1", "ctrl+?"))):
+		// Show contextual help dialog with ALL available key bindings
+		return m, core.CmdHandler(dialog.OpenDialogMsg{
+			Model: dialog.NewHelpDialog(m.AllBindings()),
+		})
 	}
 
 	// History search is a modal state — capture all remaining keys before normal routing
@@ -1625,6 +1794,9 @@ func (m *appModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	// Toggle sidebar (propagates to content view regardless of focus)
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+b"))):
+		if m.leanMode {
+			return m, nil
+		}
 		updated, cmd := m.chatPage.Update(msg)
 		m.chatPage = updated.(chat.Page)
 		return m, cmd
@@ -1694,6 +1866,11 @@ func (m *appModel) switchFocus() (tea.Model, tea.Cmd) {
 
 // handleMouseClick routes mouse clicks to the appropriate component based on Y coordinate.
 func (m *appModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	// Check if click hits a notification close button
+	if cmd := m.notification.HandleClick(msg.X, msg.Y); cmd != nil {
+		return m, cmd
+	}
+
 	// Dialogs use full-window coordinates (they're positioned over the entire screen)
 	if m.dialogMgr.Open() {
 		u, cmd := m.dialogMgr.Update(msg)
@@ -1870,6 +2047,14 @@ const (
 
 // hitTestRegion determines which layout region a Y coordinate falls in.
 func (m *appModel) hitTestRegion(y int) layoutRegion {
+	if m.leanMode {
+		// Lean mode: content | editor (no resize handle, tab bar, or status bar)
+		if y < m.contentHeight {
+			return regionContent
+		}
+		return regionEditor
+	}
+
 	tabBarHeight := m.tabBar.Height()
 
 	resizeHandleTop := m.contentHeight
@@ -1910,6 +2095,17 @@ func (m *appModel) handleEditorResize(y int) tea.Cmd {
 		return m.resizeAll()
 	}
 	return nil
+}
+
+// renderLeanWorkingIndicator renders a single-line working indicator for lean mode.
+func (m *appModel) renderLeanWorkingIndicator() string {
+	innerWidth := m.width - appPaddingHorizontal
+	workingText := "Working\u2026"
+	if queueLen := m.chatPage.QueueLength(); queueLen > 0 {
+		workingText = fmt.Sprintf("Working\u2026 (%d queued)", queueLen)
+	}
+	line := m.workingSpinner.View() + " " + styles.SpinnerDotsHighlightStyle.Render(workingText)
+	return lipgloss.NewStyle().Padding(0, styles.AppPadding).Width(innerWidth + appPaddingHorizontal).Render(line)
 }
 
 // renderResizeHandle renders the draggable separator between content and bottom panel.
@@ -1969,7 +2165,7 @@ func (m *appModel) View() tea.View {
 	windowTitle := m.windowTitle()
 
 	if m.err != nil {
-		return toFullscreenView(styles.ErrorStyle.Render(m.err.Error()), windowTitle, false)
+		return toFullscreenView(styles.ErrorStyle.Render(m.err.Error()), windowTitle, false, m.leanMode)
 	}
 
 	if !m.ready {
@@ -1980,11 +2176,25 @@ func (m *appModel) View() tea.View {
 				Render(styles.MutedStyle.Render("Loading…")),
 			windowTitle,
 			false,
+			m.leanMode,
 		)
 	}
 
 	// Content area (messages + sidebar) -- swaps per tab
 	contentView := m.chatPage.View()
+
+	// Lean mode: editor appears right after the last message, with empty
+	// space pushed to the top via bottom-alignment.
+	if m.leanMode {
+		viewParts := []string{contentView}
+		if m.chatPage.IsWorking() {
+			viewParts = append(viewParts, m.renderLeanWorkingIndicator())
+		}
+		viewParts = append(viewParts, m.editor.View())
+		inner := lipgloss.JoinVertical(lipgloss.Top, viewParts...)
+		baseView := lipgloss.PlaceVertical(m.height, lipgloss.Bottom, inner)
+		return toFullscreenView(baseView, windowTitle, m.chatPage.IsWorking(), m.leanMode)
+	}
 
 	// Resize handle (between content and bottom panel)
 	resizeHandle := m.renderResizeHandle(m.width)
@@ -2036,10 +2246,10 @@ func (m *appModel) View() tea.View {
 		}
 
 		compositor := lipgloss.NewCompositor(allLayers...)
-		return toFullscreenView(compositor.Render(), windowTitle, m.chatPage.IsWorking())
+		return toFullscreenView(compositor.Render(), windowTitle, m.chatPage.IsWorking(), m.leanMode)
 	}
 
-	return toFullscreenView(baseView, windowTitle, m.chatPage.IsWorking())
+	return toFullscreenView(baseView, windowTitle, m.chatPage.IsWorking(), m.leanMode)
 }
 
 // windowTitle returns the terminal window title.
@@ -2056,20 +2266,31 @@ func (m *appModel) windowTitle() string {
 	return title
 }
 
+// exitFunc is the function called by the shutdown safety net when the
+// graceful exit times out. It defaults to os.Exit but can be replaced
+// in tests.
+var exitFunc = os.Exit
+
+var shutdownTimeout = 5 * time.Second
+
 // cleanupAll cleans up all sessions, editors, and resources.
 func (m *appModel) cleanupAll() {
-	if m.cancelThinkingCheck != nil {
-		m.cancelThinkingCheck()
-		m.cancelThinkingCheck = nil
-	}
 	m.transcriber.Stop()
 	m.closeTranscriptCh()
-	for _, cp := range m.chatPages {
-		cp.Cleanup()
-	}
 	for _, ed := range m.editors {
 		ed.Cleanup()
 	}
+
+	// Safety net: force-exit if bubbletea's shutdown gets stuck.
+	// This can happen when the renderer's flush goroutine blocks on a
+	// stdout write (terminal buffer full) while holding the renderer
+	// mutex, preventing the event loop from completing the render call
+	// that follows tea.Quit.
+	go func() {
+		time.Sleep(shutdownTimeout)
+		slog.Warn("Graceful shutdown timed out, forcing exit")
+		exitFunc(0)
+	}()
 }
 
 // persistedSessionID returns the session-store ID that should be used for
@@ -2223,9 +2444,9 @@ func getEditorDisplayNameFromEnv(visual, editorEnv string) string {
 	return "$EDITOR"
 }
 
-func toFullscreenView(content, windowTitle string, working bool) tea.View {
+func toFullscreenView(content, windowTitle string, working, leanMode bool) tea.View {
 	view := tea.NewView(content)
-	view.AltScreen = true
+	view.AltScreen = !leanMode
 	view.MouseMode = tea.MouseModeCellMotion
 	view.BackgroundColor = styles.Background
 	view.WindowTitle = windowTitle

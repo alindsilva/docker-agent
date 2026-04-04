@@ -22,10 +22,19 @@ type Skill struct {
 	FilePath      string            `yaml:"-"`
 	BaseDir       string            `yaml:"-"`
 	Files         []string          `yaml:"-"`
+	Local         bool              `yaml:"-"` // true for filesystem-loaded skills, false for remote
 	License       string            `yaml:"license"`
 	Compatibility string            `yaml:"compatibility"`
 	Metadata      map[string]string `yaml:"metadata"`
 	AllowedTools  stringOrList      `yaml:"allowed-tools"`
+	Context       string            `yaml:"context"` // "fork" to run the skill as an isolated sub-agent
+}
+
+// IsFork returns true when the skill should be executed in an isolated
+// sub-agent context rather than inline in the current conversation.
+// This matches Claude Code's `context: fork` frontmatter syntax.
+func (s *Skill) IsFork() bool {
+	return s.Context == "fork"
 }
 
 // stringOrList is a []string that can be unmarshalled from either a YAML list
@@ -308,6 +317,7 @@ func loadSkillFile(path, dirName string) (Skill, bool) {
 	skill.Name = cmp.Or(skill.Name, dirName)
 	skill.FilePath = path
 	skill.BaseDir = filepath.Dir(path)
+	skill.Local = true
 
 	return skill, true
 }

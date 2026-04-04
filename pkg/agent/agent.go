@@ -33,13 +33,14 @@ type Agent struct {
 	addEnvironmentInfo      bool
 	addDescriptionParameter bool
 	maxIterations           int
+	maxConsecutiveToolCalls int
+	maxOldToolCallTokens    int
 	numHistoryItems         int
 	addPromptFiles          []string
 	tools                   []tools.Tool
 	commands                types.Commands
 	pendingWarnings         []string
 	hooks                   *latest.HooksConfig
-	thinkingConfigured      bool // true if thinking_budget was explicitly set in config
 }
 
 // New creates a new agent
@@ -77,19 +78,20 @@ func (a *Agent) MaxIterations() int {
 	return a.maxIterations
 }
 
+func (a *Agent) MaxConsecutiveToolCalls() int {
+	return a.maxConsecutiveToolCalls
+}
+
+func (a *Agent) MaxOldToolCallTokens() int {
+	return a.maxOldToolCallTokens
+}
+
 func (a *Agent) NumHistoryItems() int {
 	return a.numHistoryItems
 }
 
 func (a *Agent) AddPromptFiles() []string {
 	return a.addPromptFiles
-}
-
-// ThinkingConfigured returns true if thinking_budget was explicitly set in the agent's config.
-// This is used to initialize session thinking state - thinking is only enabled by default
-// when the user explicitly configured it in their YAML.
-func (a *Agent) ThinkingConfigured() bool {
-	return a.thinkingConfigured
 }
 
 // Description returns the agent's description
@@ -126,11 +128,18 @@ func (a *Agent) HasSubAgents() bool {
 // If model override(s) are set, it returns one of the overrides (randomly for alloy).
 // Otherwise, it returns a random model from the available models.
 func (a *Agent) Model() provider.Provider {
+	var selected provider.Provider
+	var poolSize int
 	// Check for model override first (set via TUI model switching)
 	if overrides := a.modelOverrides.Load(); overrides != nil && len(*overrides) > 0 {
-		return (*overrides)[rand.Intn(len(*overrides))]
+		selected = (*overrides)[rand.Intn(len(*overrides))]
+		poolSize = len(*overrides)
+	} else {
+		selected = a.models[rand.Intn(len(a.models))]
+		poolSize = len(a.models)
 	}
-	return a.models[rand.Intn(len(a.models))]
+	slog.Info("Model selected", "agent", a.name, "model", selected.ID(), "pool_size", poolSize)
+	return selected
 }
 
 // SetModelOverride sets runtime model override(s) for this agent.

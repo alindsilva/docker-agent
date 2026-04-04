@@ -14,6 +14,7 @@ import (
 const (
 	ToolNameReadSkill     = "read_skill"
 	ToolNameReadSkillFile = "read_skill_file"
+	ToolNameRunSkill      = "run_skill"
 )
 
 var (
@@ -25,12 +26,14 @@ var (
 // agent load skill content and supporting resources by name. It hides whether
 // a skill is local or remote — the agent just sees a name and description.
 type SkillsToolset struct {
-	skills []skills.Skill
+	skills     []skills.Skill
+	workingDir string
 }
 
-func NewSkillsToolset(loadedSkills []skills.Skill) *SkillsToolset {
+func NewSkillsToolset(loadedSkills []skills.Skill, workingDir string) *SkillsToolset {
 	return &SkillsToolset{
-		skills: loadedSkills,
+		skills:     loadedSkills,
+		workingDir: workingDir,
 	}
 }
 
@@ -48,8 +51,16 @@ func (s *SkillsToolset) findSkill(name string) *skills.Skill {
 	return nil
 }
 
+// FindSkill returns the skill with the given name, or nil if not found.
+func (s *SkillsToolset) FindSkill(name string) *skills.Skill {
+	return s.findSkill(name)
+}
+
 // ReadSkillContent returns the content of a skill's SKILL.md by name.
-func (s *SkillsToolset) ReadSkillContent(name string) (string, error) {
+// For local skills, it expands any !`command` patterns in the content by
+// executing the commands and replacing the patterns with their stdout output.
+// Command expansion is disabled for remote skills to prevent arbitrary code execution.
+func (s *SkillsToolset) ReadSkillContent(ctx context.Context, name string) (string, error) {
 	skill := s.findSkill(name)
 	if skill == nil {
 		return "", fmt.Errorf("skill %q not found", name)
@@ -58,6 +69,10 @@ func (s *SkillsToolset) ReadSkillContent(name string) (string, error) {
 	content, err := readFileContent(skill.FilePath)
 	if err != nil {
 		return "", err
+	}
+
+	if skill.Local {
+		content = skills.ExpandCommands(ctx, content, s.workingDir)
 	}
 
 	return content, nil
@@ -119,8 +134,8 @@ type readSkillFileArgs struct {
 	Path      string `json:"path" jsonschema:"The relative path to the file within the skill (e.g. references/FORMS.md)"`
 }
 
-func (s *SkillsToolset) handleReadSkill(_ context.Context, args readSkillArgs) (*tools.ToolCallResult, error) {
-	content, err := s.ReadSkillContent(args.Name)
+func (s *SkillsToolset) handleReadSkill(ctx context.Context, args readSkillArgs) (*tools.ToolCallResult, error) {
+	content, err := s.ReadSkillContent(ctx, args.Name)
 	if err != nil {
 		return tools.ResultError(err.Error()), nil
 	}
@@ -145,6 +160,16 @@ func (s *SkillsToolset) hasFiles() bool {
 	return false
 }
 
+// hasForkSkills reports whether any loaded skill uses context: fork.
+func (s *SkillsToolset) hasForkSkills() bool {
+	for i := range s.skills {
+		if s.skills[i].IsFork() {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *SkillsToolset) Instructions() string {
 	if len(s.skills) == 0 {
 		return ""
@@ -153,6 +178,13 @@ func (s *SkillsToolset) Instructions() string {
 	var sb strings.Builder
 	sb.WriteString("Skills provide specialized instructions for specific tasks. ")
 	sb.WriteString("When a user's request matches a skill's description, use read_skill to load its instructions.\n\n")
+
+	hasFork := s.hasForkSkills()
+	if hasFork {
+		sb.WriteString("Some skills are configured to run as isolated sub-agents (context: fork). ")
+		sb.WriteString("For those skills use run_skill instead of read_skill so they execute in a dedicated context ")
+		sb.WriteString("with their own conversation history.\n\n")
+	}
 
 	if s.hasFiles() {
 		sb.WriteString("Some skills have supporting files. ")
@@ -168,6 +200,9 @@ func (s *SkillsToolset) Instructions() string {
 		sb.WriteString("    <description>")
 		sb.WriteString(skill.Description)
 		sb.WriteString("</description>\n")
+		if skill.IsFork() {
+			sb.WriteString("    <mode>sub-agent</mode>\n")
+		}
 		if len(skill.Files) > 1 {
 			sb.WriteString("    <files>")
 			// List files excluding SKILL.md itself
@@ -189,6 +224,12 @@ func (s *SkillsToolset) Instructions() string {
 	sb.WriteString("</available_skills>")
 
 	return sb.String()
+}
+
+// RunSkillArgs specifies the parameters for the run_skill tool.
+type RunSkillArgs struct {
+	Name string `json:"name" jsonschema:"The name of the skill to run as a sub-agent"`
+	Task string `json:"task" jsonschema:"A clear description of the task the skill sub-agent should achieve"`
 }
 
 func (s *SkillsToolset) Tools(context.Context) ([]tools.Tool, error) {
@@ -223,6 +264,20 @@ func (s *SkillsToolset) Tools(context.Context) ([]tools.Tool, error) {
 			Annotations: tools.ToolAnnotations{
 				Title:        "Read Skill File",
 				ReadOnlyHint: true,
+			},
+		})
+	}
+
+	// Expose run_skill if any skill uses context: fork
+	if s.hasForkSkills() {
+		result = append(result, tools.Tool{
+			Name:         ToolNameRunSkill,
+			Category:     "skills",
+			Description:  "Run a skill as an isolated sub-agent with its own conversation context. Use this for skills marked with sub-agent mode.",
+			Parameters:   tools.MustSchemaFor[RunSkillArgs](),
+			OutputSchema: tools.MustSchemaFor[string](),
+			Annotations: tools.ToolAnnotations{
+				Title: "Run Skill",
 			},
 		})
 	}

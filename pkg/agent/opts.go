@@ -127,6 +127,26 @@ func WithMaxIterations(maxIterations int) Opt {
 	}
 }
 
+// WithMaxConsecutiveToolCalls sets the threshold for consecutive identical tool
+// call detection. 0 means "use runtime default of 5". Negative values are
+// ignored.
+func WithMaxConsecutiveToolCalls(n int) Opt {
+	return func(a *Agent) {
+		if n >= 0 {
+			a.maxConsecutiveToolCalls = n
+		}
+	}
+}
+
+// WithMaxOldToolCallTokens sets the maximum token budget for old tool call content.
+// Set to -1 to disable truncation (unlimited tool content).
+// Set to 0 to use the default (40000).
+func WithMaxOldToolCallTokens(n int) Opt {
+	return func(a *Agent) {
+		a.maxOldToolCallTokens = n
+	}
+}
+
 func WithNumHistoryItems(numHistoryItems int) Opt {
 	return func(a *Agent) {
 		a.numHistoryItems = numHistoryItems
@@ -150,13 +170,5 @@ func WithLoadTimeWarnings(warnings []string) Opt {
 func WithHooks(hooks *latest.HooksConfig) Opt {
 	return func(a *Agent) {
 		a.hooks = hooks
-	}
-}
-
-// WithThinkingConfigured sets whether thinking_budget was explicitly configured in the agent's YAML.
-// When true, the session will initialize with thinking enabled.
-func WithThinkingConfigured(configured bool) Opt {
-	return func(a *Agent) {
-		a.thinkingConfigured = configured
 	}
 }

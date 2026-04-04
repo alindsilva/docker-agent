@@ -176,7 +176,7 @@ export DOCKER_AGENT_AUTO_INSTALL=false
 
 Installed binaries are placed in `~/.cagent/tools/bin/` and cached so they are only downloaded once.
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Tip
 </div>
   <p>Auto-install supports both Go packages (via <code>go install</code>) and GitHub release binaries (via archive download). The aqua registry metadata determines which method is used.</p>
@@ -197,7 +197,7 @@ toolsets:
     tools: ["shell"]
 ```
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Tip
 </div>
   <p>Filtering tools improves agent performance — fewer tools means less confusion for the model about which tool to use.</p>
@@ -269,10 +269,10 @@ agents:
         shell:
           run_tests:
             description: Run the test suite
-            cmd: task test
+            cmd: mise test
           lint:
             description: Run the linter
-            cmd: task lint
+            cmd: mise lint
       # Custom API tool
       - type: api
         api_config:
@@ -295,7 +295,7 @@ agents:
             Authorization: "Bearer ${INTERNAL_TOKEN}"
 ```
 
-<div class="callout callout-warning">
+<div class="callout callout-warning" markdown="1">
 <div class="callout-title">⚠️ Toolset Order Matters
 </div>
   <p>If multiple toolsets provide a tool with the same name, the first one wins. Order your toolsets intentionally.</p>

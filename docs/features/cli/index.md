@@ -8,7 +8,7 @@ permalink: /features/cli/
 
 _Complete reference for all docker-agent command-line commands and flags._
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 No config needed
 </div>
   <p>Running <code>docker agent run</code> without a config file uses a built-in default agent. Perfect for quick experimentation.</p>
@@ -25,16 +25,21 @@ Launch the interactive TUI with an agent configuration.
 $ docker agent run [config] [message...] [flags]
 ```
 
-| Flag                         | Description                                                                                                                               |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `-a, --agent &lt;name&gt;`   | Run a specific agent from the config                                                                                                      |
-| `--yolo`                     | Auto-approve all tool calls                                                                                                               |
-| `--model &lt;ref&gt;`        | Override model(s). Use `provider/model` for all agents, or `agent=provider/model` for specific agents. Comma-separate multiple overrides. |
-| `--session &lt;id&gt;`       | Resume a previous session. Supports relative refs (`-1` = last, `-2` = second to last)                                                    |
-| `--prompt-file &lt;path&gt;` | Include file contents as additional system context (repeatable)                                                                           |
-| `-d, --debug`                | Enable debug logging                                                                                                                      |
-| `--log-file &lt;path&gt;`    | Custom debug log location                                                                                                                 |
-| `-o, --otel`                 | Enable OpenTelemetry tracing                                                                                                              |
+| Flag                                    | Description                                                                                                                               |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `-a, --agent &lt;name&gt;`              | Run a specific agent from the config                                                                                                      |
+| `--yolo`                                | Auto-approve all tool calls                                                                                                               |
+| `--model &lt;ref&gt;`                   | Override model(s). Use `provider/model` for all agents, or `agent=provider/model` for specific agents. Comma-separate multiple overrides. |
+| `--session &lt;id&gt;`                  | Resume a previous session. Supports relative refs (`-1` = last, `-2` = second to last)                                                    |
+| `--prompt-file &lt;path&gt;`            | Include file contents as additional system context (repeatable)                                                                           |
+| `--hook-pre-tool-use &lt;cmd&gt;`       | Add a pre-tool-use hook command (repeatable). See [Hooks]({{ '/configuration/hooks/' | relative_url }}).                                  |
+| `--hook-post-tool-use &lt;cmd&gt;`      | Add a post-tool-use hook command (repeatable)                                                                                             |
+| `--hook-session-start &lt;cmd&gt;`      | Add a session-start hook command (repeatable)                                                                                             |
+| `--hook-session-end &lt;cmd&gt;`        | Add a session-end hook command (repeatable)                                                                                               |
+| `--hook-on-user-input &lt;cmd&gt;`      | Add an on-user-input hook command (repeatable)                                                                                            |
+| `-d, --debug`                           | Enable debug logging                                                                                                                      |
+| `--log-file &lt;path&gt;`               | Custom debug log location                                                                                                                 |
+| `-o, --otel`                            | Enable OpenTelemetry tracing                                                                                                              |
 
 ```bash
 # Examples
@@ -45,6 +50,10 @@ $ docker agent run agent.yaml --model anthropic/claude-sonnet-4-0
 $ docker agent run agent.yaml --model "dev=openai/gpt-4o,reviewer=anthropic/claude-sonnet-4-0"
 $ docker agent run agent.yaml --session -1  # resume last session
 $ docker agent run agent.yaml --prompt-file ./context.md  # include file as context
+
+# Add hooks from the command line
+$ docker agent run agent.yaml --hook-session-start "./scripts/setup-env.sh"
+$ docker agent run agent.yaml --hook-pre-tool-use "./scripts/validate.sh" --hook-post-tool-use "./scripts/log.sh"
 
 # Queue multiple messages (processed in sequence)
 $ docker agent run agent.yaml "question 1" "question 2" "question 3"
@@ -202,14 +211,14 @@ Registered aliases (3):
 Run an alias with: docker agent run <alias>
 ```
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Override alias options
 </div>
   <p>Command-line flags override alias options. For example, <code>docker agent run yolo-coder --yolo=false</code> disables yolo mode even though the alias has it enabled.</p>
 
 </div>
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Set a default agent
 </div>
   <p>Create a <code>default</code> alias to customize what <code>docker agent</code> starts with no arguments:</p>
@@ -239,7 +248,7 @@ Commands that accept a config support multiple reference types:
 | Alias         | `pirate` (after `docker agent alias add`)   |
 | Default       | (no argument) — uses built-in default agent |
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ Debugging
 </div>
   <p>Having issues? See <a href="{{ '/community/troubleshooting/' | relative_url }}">Troubleshooting</a> for debug mode, log analysis, and common solutions.</p>

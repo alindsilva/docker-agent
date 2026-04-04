@@ -36,7 +36,9 @@ agents:
     model: openai/gpt-4o
     instruction: |
       You have access to a knowledge base. Use it to answer questions.
-    rag: [my_docs]
+    toolsets:
+      - type: rag
+        ref: my_docs
 ```
 
 ## Retrieval Strategies
@@ -77,7 +79,7 @@ strategies:
       code_aware: true # AST-aware chunking
 ```
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ Trade-offs
 </div>
   <p>Semantic embeddings provide higher quality retrieval but slower indexing (LLM call per chunk) and additional API costs.</p>
@@ -164,7 +166,7 @@ chunking:
   code_aware: true # Uses tree-sitter for AST-based chunking
 ```
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ Language Support
 </div>
   <p>Currently supports Go (<code>.go</code>) files. More languages will be added. Falls back to plain text chunking for unsupported file types.</p>
@@ -181,7 +183,7 @@ $ docker agent run config.yaml --debug --log-file debug.log
 
 Look for log tags: `[RAG Manager]`, `[Chunked-Embeddings Strategy]`, `[BM25 Strategy]`, `[RRF Fusion]`, `[Reranker]`.
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Examples
 </div>
   <p>See the <a href="https://github.com/docker/docker-agent/tree/main/examples/rag">RAG examples</a> in the GitHub repo for complete, runnable configurations.</p>

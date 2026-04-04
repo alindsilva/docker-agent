@@ -89,6 +89,11 @@ type Message struct {
 	// Cost is the cost of this message in dollars (only set for assistant messages)
 	Cost float64 `json:"cost,omitempty"`
 
+	// FinishReason indicates why the model stopped generating for this message.
+	// "stop" = natural end, "tool_calls" = tool invocation, "length" = token limit.
+	// Only set for assistant messages.
+	FinishReason FinishReason `json:"finish_reason,omitempty"`
+
 	// CacheControl indicates whether this message is a cached message (only used by anthropic)
 	CacheControl bool `json:"cache_control,omitempty"`
 }
@@ -141,13 +146,12 @@ type MessageStreamChoice struct {
 
 // MessageStreamResponse represents a streaming response from the model
 type MessageStreamResponse struct {
-	ID        string                `json:"id"`
-	Object    string                `json:"object"`
-	Created   int64                 `json:"created"`
-	Model     string                `json:"model"`
-	Choices   []MessageStreamChoice `json:"choices"`
-	Usage     *Usage                `json:"usage,omitempty"`
-	RateLimit *RateLimit            `json:"rate_limit,omitempty"`
+	ID      string                `json:"id"`
+	Object  string                `json:"object"`
+	Created int64                 `json:"created"`
+	Model   string                `json:"model"`
+	Choices []MessageStreamChoice `json:"choices"`
+	Usage   *Usage                `json:"usage,omitempty"`
 }
 
 type Usage struct {
@@ -156,13 +160,6 @@ type Usage struct {
 	CachedInputTokens int64 `json:"cached_input_tokens"`
 	CacheWriteTokens  int64 `json:"cached_write_tokens"`
 	ReasoningTokens   int64 `json:"reasoning_tokens,omitempty"`
-}
-
-type RateLimit struct {
-	Limit      int64 `json:"limit,omitempty"`
-	Remaining  int64 `json:"remaining,omitempty"`
-	Reset      int64 `json:"reset,omitempty"`
-	RetryAfter int64 `json:"retry_after,omitempty"`
 }
 
 // MessageStream interface represents a stream of chat completions

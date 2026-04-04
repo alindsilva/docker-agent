@@ -160,6 +160,8 @@ func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mc
 		sess := session.New(
 			session.WithTitle("MCP tool call"),
 			session.WithMaxIterations(ag.MaxIterations()),
+			session.WithMaxConsecutiveToolCalls(ag.MaxConsecutiveToolCalls()),
+			session.WithMaxOldToolCallTokens(ag.MaxOldToolCallTokens()),
 			session.WithUserMessage(input.Message),
 			session.WithToolsApproved(true),
 		)

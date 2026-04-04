@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/shellpath"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -116,6 +117,7 @@ func (t *ScriptShellTool) Tools(context.Context) ([]tools.Tool, error) {
 
 		toolsList = append(toolsList, tools.Tool{
 			Name:         toolName,
+			Category:     "shell",
 			Description:  description,
 			Parameters:   inputSchema,
 			OutputSchema: tools.MustSchemaFor[string](),
@@ -136,15 +138,14 @@ func (t *ScriptShellTool) execute(ctx context.Context, toolConfig *latest.Script
 		}
 	}
 
-	// Use default shell
-	shell := cmp.Or(os.Getenv("SHELL"), "/bin/sh")
+	shell, argsPrefix := shellpath.DetectShell()
 
-	cmd := exec.CommandContext(ctx, shell, "-c", toolConfig.Cmd)
+	cmd := exec.CommandContext(ctx, shell, append(argsPrefix, toolConfig.Cmd)...)
 	cmd.Dir = toolConfig.WorkingDir
 	cmd.Env = t.env
 	for key, value := range params {
 		if value != nil {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, value))
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%v", key, value))
 		}
 	}
 

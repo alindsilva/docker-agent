@@ -1,6 +1,8 @@
 package session
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"slices"
@@ -16,10 +18,10 @@ import (
 )
 
 const (
-	// MaxToolCallTokens is the maximum number of tokens to keep from tool call
+	// DefaultMaxOldToolCallTokens is the default maximum number of tokens to keep from tool call
 	// arguments and results. Older tool calls beyond this budget will have their
 	// content replaced with a placeholder. Tokens are approximated as len/4.
-	MaxToolCallTokens = 40000
+	DefaultMaxOldToolCallTokens = 40000
 
 	// toolContentPlaceholder is the text used to replace truncated tool content
 	toolContentPlaceholder = "[content truncated]"
@@ -35,6 +37,13 @@ type Item struct {
 
 	// Summary is a summary of the session up until this point
 	Summary string `json:"summary,omitempty"`
+
+	// FirstKeptEntry is the index (into the session's Messages slice) of the
+	// first message that was kept verbatim during compaction. Messages from
+	// this index onward (up to the summary item itself) are appended after
+	// the summary when reconstructing the conversation. A value of -1 (or 0
+	// with no summary) means no messages were kept.
+	FirstKeptEntry int `json:"first_kept_entry,omitempty"`
 
 	// Cost tracks the cost of operations associated with this item that
 	// don't produce a regular message (e.g., compaction/summarization).
@@ -65,6 +74,9 @@ type Session struct {
 	// Evals contains evaluation criteria for this session (used by eval framework)
 	Evals *EvalCriteria `json:"evals,omitempty"`
 
+	// EvalResult contains the evaluation scoring outcome (populated after eval run).
+	EvalResult *EvalResult `json:"eval_result,omitempty"`
+
 	// Messages holds the conversation history (messages and sub-sessions)
 	Messages []Item `json:"messages"`
 
@@ -73,12 +85,6 @@ type Session struct {
 
 	// ToolsApproved is a flag to indicate if the tools have been approved
 	ToolsApproved bool `json:"tools_approved"`
-
-	// Thinking is a session-level flag to enable thinking/interleaved thinking
-	// defaults for all providers. When false, providers will not apply auto-thinking budgets
-	// or interleaved thinking, regardless of model config. This is controlled by the /think
-	// command in the TUI. Defaults to true (thinking enabled).
-	Thinking bool `json:"thinking"`
 
 	// HideToolResults is a flag to indicate if tool results should be hidden
 	HideToolResults bool `json:"hide_tool_results"`
@@ -92,6 +98,18 @@ type Session struct {
 	// MaxIterations is the maximum number of agentic loop iterations to prevent infinite loops
 	// If 0, there is no limit
 	MaxIterations int `json:"max_iterations"`
+
+	// MaxConsecutiveToolCalls is the maximum number of consecutive identical tool call
+	// batches before the agent is terminated. Prevents degenerate loops where the model
+	// repeatedly issues the same call without making progress. Default: 5.
+	MaxConsecutiveToolCalls int `json:"max_consecutive_tool_calls,omitempty"`
+
+	// MaxOldToolCallTokens is the maximum number of tokens to keep from old tool call
+	// arguments and results. Older tool calls beyond this budget will have their
+	// content replaced with a placeholder. Tokens are approximated as len/4.
+	// Set to -1 to disable truncation (unlimited tool content).
+	// Default: 40000 (when not configured or set to 0).
+	MaxOldToolCallTokens int `json:"max_old_tool_call_tokens,omitempty"`
 
 	// Starred indicates if this session has been starred by the user
 	Starred bool `json:"starred"`
@@ -112,6 +130,11 @@ type Session struct {
 	// CustomModelsUsed tracks custom models (provider/model format) used during this session.
 	// These are shown in the model picker for easy re-selection.
 	CustomModelsUsed []string `json:"custom_models_used,omitempty"`
+
+	// ExcludedTools lists tool names that should be filtered out of the agent's
+	// tool list for this session. This is used by skill sub-sessions to prevent
+	// recursive run_skill calls.
+	ExcludedTools []string `json:"-"`
 
 	// AgentName, when set, tells RunStream which agent to use for this session
 	// instead of reading from the shared runtime currentAgent field. This is
@@ -209,12 +232,75 @@ func NewSubSessionItem(subSession *Session) Item {
 	return Item{SubSession: subSession}
 }
 
+// EvalResult contains the evaluation scoring outcome for a session.
+type EvalResult struct {
+	Passed       bool             `json:"passed"`
+	Successes    []string         `json:"successes,omitempty"`
+	Failures     []string         `json:"failures,omitempty"`
+	Error        string           `json:"error,omitempty"`
+	Cost         float64          `json:"cost"`
+	OutputTokens int64            `json:"output_tokens"`
+	Checks       EvalResultChecks `json:"checks"`
+}
+
+// EvalResultChecks groups the individual check results.
+// Only checks that were evaluated will be present (omitted if nil).
+type EvalResultChecks struct {
+	Size      *SizeCheck      `json:"size,omitempty"`
+	ToolCalls *ToolCallsCheck `json:"tool_calls,omitempty"`
+	Relevance *RelevanceCheck `json:"relevance,omitempty"`
+}
+
+// SizeCheck contains the result of the response size check.
+type SizeCheck struct {
+	Passed   bool   `json:"passed"`
+	Actual   string `json:"actual"`
+	Expected string `json:"expected"`
+}
+
+// ToolCallsCheck contains the result of the tool calls F1 score check.
+type ToolCallsCheck struct {
+	Passed bool    `json:"passed"`
+	Score  float64 `json:"score"`
+}
+
+// RelevanceCheck contains the result of the LLM judge relevance check.
+type RelevanceCheck struct {
+	Passed      bool                       `json:"passed"`
+	PassedCount float64                    `json:"passed_count"`
+	Total       float64                    `json:"total"`
+	Results     []RelevanceCriterionResult `json:"results"`
+}
+
+// RelevanceCriterionResult contains the judge's verdict on a single relevance criterion.
+type RelevanceCriterionResult struct {
+	Criterion string `json:"criterion"`
+	Passed    bool   `json:"passed"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // EvalCriteria contains the evaluation criteria for a session.
 type EvalCriteria struct {
 	Relevance  []string `json:"relevance"`             // Statements that should be true about the response
 	WorkingDir string   `json:"working_dir,omitempty"` // Subdirectory under evals/working_dirs/
 	Size       string   `json:"size,omitempty"`        // Expected response size: S, M, L, XL
 	Setup      string   `json:"setup,omitempty"`       // Optional sh script to run in the container before docker agent run --exec
+	Image      string   `json:"image,omitempty"`       // Custom Docker image for this eval (overrides --base-image)
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling for EvalCriteria that
+// rejects unknown fields. This ensures eval JSON files don't contain typos
+// or unsupported fields that would be silently ignored.
+func (e *EvalCriteria) UnmarshalJSON(data []byte) error {
+	type evalCriteria EvalCriteria // alias to avoid infinite recursion
+	var v evalCriteria
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&v); err != nil {
+		return err
+	}
+	*e = EvalCriteria(v)
+	return nil
 }
 
 // deepCopyMessage returns a deep copy of a session Message.
@@ -414,6 +500,26 @@ func WithMaxIterations(maxIterations int) Opt {
 	}
 }
 
+// WithMaxConsecutiveToolCalls sets the threshold for consecutive identical tool
+// call detection. 0 means "use runtime default of 5". Negative values are
+// ignored.
+func WithMaxConsecutiveToolCalls(n int) Opt {
+	return func(s *Session) {
+		if n >= 0 {
+			s.MaxConsecutiveToolCalls = n
+		}
+	}
+}
+
+// WithMaxOldToolCallTokens sets the maximum token budget for old tool call content.
+// Set to -1 to disable truncation (unlimited tool content).
+// Set to 0 to use the default (40000).
+func WithMaxOldToolCallTokens(n int) Opt {
+	return func(s *Session) {
+		s.MaxOldToolCallTokens = n
+	}
+}
+
 func WithWorkingDir(workingDir string) Opt {
 	return func(s *Session) {
 		s.WorkingDir = workingDir
@@ -426,15 +532,15 @@ func WithTitle(title string) Opt {
 	}
 }
 
-func WithToolsApproved(toolsApproved bool) Opt {
+func WithMessages(messages []Item) Opt {
 	return func(s *Session) {
-		s.ToolsApproved = toolsApproved
+		s.Messages = messages
 	}
 }
 
-func WithThinking(thinking bool) Opt {
+func WithToolsApproved(toolsApproved bool) Opt {
 	return func(s *Session) {
-		s.Thinking = thinking
+		s.ToolsApproved = toolsApproved
 	}
 }
 
@@ -470,6 +576,15 @@ func WithAgentName(name string) Opt {
 func WithParentID(parentID string) Opt {
 	return func(s *Session) {
 		s.ParentID = parentID
+	}
+}
+
+// WithExcludedTools sets tool names that should be filtered out of the agent's
+// tool list for this session. This prevents recursive tool calls in skill
+// sub-sessions.
+func WithExcludedTools(names []string) Opt {
+	return func(s *Session) {
+		s.ExcludedTools = names
 	}
 }
 
@@ -539,7 +654,6 @@ func New(opts ...Opt) *Session {
 		ID:              sessionID,
 		CreatedAt:       time.Now(),
 		SendUserMessage: true,
-		Thinking:        false,
 	}
 
 	for _, opt := range opts {
@@ -689,7 +803,11 @@ func buildContextSpecificSystemMessages(a *agent.Agent, s *Session) []chat.Messa
 // buildSessionSummaryMessages builds system messages containing the session summary
 // if one exists. Session summaries are context-specific per session and thus should not have a checkpoint (they will be cached alongside the first user message anyway)
 //
-// lastSummaryIndex is the index of the last summary item in s.Messages, or -1 if none exists.
+// startIndex is the index in items from which conversation messages should be
+// emitted. When a summary with FirstKeptEntry is present, this points to the
+// first kept message so that recent context is preserved after compaction.
+// Otherwise it is lastSummaryIndex+1 (i.e. right after the summary item), or
+// 0 when there is no summary.
 func buildSessionSummaryMessages(items []Item) ([]chat.Message, int) {
 	var messages []chat.Message
 	// Find the last summary index to determine where conversation messages start
@@ -710,7 +828,18 @@ func buildSessionSummaryMessages(items []Item) ([]chat.Message, int) {
 		})
 	}
 
-	return messages, lastSummaryIndex
+	// Determine where conversation messages should start.
+	// If the summary has a FirstKeptEntry, we start from there so that
+	// messages kept during compaction are included after the summary.
+	startIndex := lastSummaryIndex + 1
+	if lastSummaryIndex >= 0 {
+		kept := items[lastSummaryIndex].FirstKeptEntry
+		if kept > 0 && kept < lastSummaryIndex {
+			startIndex = kept
+		}
+	}
+
+	return messages, startIndex
 }
 
 func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
@@ -738,14 +867,12 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 	s.mu.RUnlock()
 
 	// Build session summary messages (vary per session)
-	summaryMessages, lastSummaryIndex := buildSessionSummaryMessages(items)
+	summaryMessages, startIndex := buildSessionSummaryMessages(items)
 
 	var messages []chat.Message
 	messages = append(messages, invariantMessages...)
 	messages = append(messages, contextMessages...)
 	messages = append(messages, summaryMessages...)
-
-	startIndex := lastSummaryIndex + 1
 
 	// Begin adding conversation messages
 	for i := startIndex; i < len(items); i++ {
@@ -760,7 +887,15 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		messages = trimMessages(messages, maxItems)
 	}
 
-	messages = truncateOldToolContent(messages, MaxToolCallTokens)
+	// Use configured max tokens or fall back to default constant if zero or unset.
+	// -1 means unlimited (no truncation).
+	maxOldToolCallTokens := s.MaxOldToolCallTokens
+	if maxOldToolCallTokens == 0 {
+		maxOldToolCallTokens = DefaultMaxOldToolCallTokens
+	}
+	if maxOldToolCallTokens > 0 { // If maxOldToolCallTokens is -1, skip truncation (unlimited)
+		messages = truncateOldToolContent(messages, maxOldToolCallTokens)
+	}
 
 	systemCount := 0
 	conversationCount := 0

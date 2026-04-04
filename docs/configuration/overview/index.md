@@ -53,7 +53,8 @@ providers:
     base_url: https://api.example.com/v1
     token_key: MY_API_KEY
 
-# 7. Permissions — global tool permission rules (optional)
+# 7. Permissions — agent-level tool permission rules (optional)
+#    For user-wide global permissions, see ~/.config/cagent/config.yaml
 permissions:
   allow: ["read_*"]
   deny: ["shell:cmd=sudo*"]
@@ -135,7 +136,7 @@ Models can be referenced inline or defined in the `models` section:
 
 ## Environment Variables
 
-API keys and secrets are read from environment variables — never stored in config files:
+API keys and secrets are read from environment variables — never stored in config files. See [Managing Secrets]({{ '/guides/secrets/' | relative_url }}) for all the ways to provide credentials (env files, Docker Compose secrets, macOS Keychain, `pass`):
 
 | Variable            | Provider      |
 | ------------------- | ------------- |
@@ -153,7 +154,7 @@ API keys and secrets are read from environment variables — never stored in con
 | `DOCKER_AGENT_AUTO_INSTALL` | Set to `false` to disable automatic tool installation           |
 | `DOCKER_AGENT_TOOLS_DIR`    | Override the base directory for installed tools (default: `~/.cagent/tools/`) |
 
-<div class="callout callout-warning">
+<div class="callout callout-warning" markdown="1">
 <div class="callout-title">⚠️ Important
 </div>
   <p>Model references are case-sensitive: <code>openai/gpt-4o</code> is not the same as <code>openai/GPT-4o</code>.</p>
@@ -164,7 +165,7 @@ API keys and secrets are read from environment variables — never stored in con
 
 docker-agent validates your configuration at startup:
 
-- All `sub_agents` must reference agents defined in the config
+- Local `sub_agents` must reference agents defined in the config (external OCI references like `agentcatalog/pirate` are pulled from registries automatically)
 - Named model references must exist in the `models` section
 - Provider names must be valid (`openai`, `anthropic`, `google`, `dmr`, etc.)
 - Required environment variables (API keys) must be set

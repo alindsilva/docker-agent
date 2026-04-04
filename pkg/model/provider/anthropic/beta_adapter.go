@@ -3,7 +3,6 @@ package anthropic
 import (
 	"fmt"
 	"log/slog"
-	"net/http"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
@@ -15,18 +14,17 @@ import (
 // betaStreamAdapter adapts the Anthropic Beta stream to our interface
 type betaStreamAdapter struct {
 	retryableStream[anthropic.BetaRawMessageStreamEventUnion]
-	trackUsage         bool
-	toolCall           bool
-	toolID             string
-	getResponseTrailer func() http.Header
+
+	trackUsage bool
+	toolCall   bool
+	toolID     string
 }
 
 // newBetaStreamAdapter creates a new Beta stream adapter
 func (c *Client) newBetaStreamAdapter(stream *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion], trackUsage bool) *betaStreamAdapter {
 	return &betaStreamAdapter{
-		retryableStream:    retryableStream[anthropic.BetaRawMessageStreamEventUnion]{stream: stream},
-		trackUsage:         trackUsage,
-		getResponseTrailer: c.getResponseTrailer,
+		retryableStream: retryableStream[anthropic.BetaRawMessageStreamEventUnion]{stream: stream},
+		trackUsage:      trackUsage,
 	}
 }
 
@@ -42,7 +40,7 @@ func (a *betaStreamAdapter) Recv() (chat.MessageStreamResponse, error) {
 	response := chat.MessageStreamResponse{
 		ID:     event.Message.ID,
 		Object: "chat.completion.chunk",
-		Model:  string(event.Message.Model),
+		Model:  event.Message.Model,
 		Choices: []chat.MessageStreamChoice{
 			{
 				Index: 0,

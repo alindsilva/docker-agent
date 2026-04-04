@@ -7,9 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genai"
 
+	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/model/provider/base"
-	"github.com/docker/docker-agent/pkg/model/provider/options"
+	"github.com/docker/docker-agent/pkg/tools"
 )
 
 func TestBuildConfig_Gemini25_ThinkingBudget(t *testing.T) {
@@ -292,52 +293,68 @@ func TestBuildConfig_CaseInsensitiveModel(t *testing.T) {
 	}
 }
 
-func TestBuildConfig_ThinkingExplicitlyDisabled(t *testing.T) {
+func TestConvertMessagesToGemini_ThoughtSignature(t *testing.T) {
 	t.Parallel()
 
-	// Test that when ModelOptions.Thinking() returns false, thinking is explicitly disabled.
-	// This is important for operations like title generation where max_tokens is very low.
+	defaultSig := thoughtSignatureOrDefault(nil) // the well-known skip sentinel
+	realSig := []byte("real-thought-signature-from-gemini")
+
 	tests := []struct {
-		name               string
-		model              string
-		thinkingBudget     *latest.ThinkingBudget // Would normally enable thinking
-		expectBudgetZero   bool                   // Gemini 2.5: ThinkingBudget=0
-		expectLevelLow     bool                   // Gemini 3: ThinkingLevelLow (cannot fully disable)
-		expectMinMaxTokens int32                  // Gemini 3: bumped MaxOutputTokens
+		name      string
+		message   chat.Message
+		wantParts int
+		wantSig   []byte
 	}{
 		{
-			name:               "gemini-3-flash-preview with thinking budget but disabled via options",
-			model:              "gemini-3-flash-preview",
-			thinkingBudget:     &latest.ThinkingBudget{Effort: "medium"},
-			expectLevelLow:     true,
-			expectMinMaxTokens: 200,
+			name: "preserves existing signature",
+			message: chat.Message{
+				Role:             chat.MessageRoleAssistant,
+				ThoughtSignature: realSig,
+				ToolCalls: []tools.ToolCall{{
+					ID:       "call-1",
+					Function: tools.FunctionCall{Name: "my_tool", Arguments: `{"key":"value"}`},
+				}},
+			},
+			wantParts: 1,
+			wantSig:   realSig,
 		},
 		{
-			name:             "gemini-2.5-flash with thinking budget but disabled via options",
-			model:            "gemini-2.5-flash",
-			thinkingBudget:   &latest.ThinkingBudget{Tokens: 8192},
-			expectBudgetZero: true,
+			name: "uses default when signature is nil (cross-model)",
+			message: chat.Message{
+				Role: chat.MessageRoleAssistant,
+				ToolCalls: []tools.ToolCall{{
+					ID:       "call-1",
+					Function: tools.FunctionCall{Name: "my_tool", Arguments: `{"key":"value"}`},
+				}},
+			},
+			wantParts: 1,
+			wantSig:   defaultSig,
 		},
 		{
-			name:               "gemini-3-pro with nil thinking budget but disabled via options",
-			model:              "gemini-3-pro",
-			thinkingBudget:     nil, // Even without explicit budget, Gemini 3 may use thinking by default
-			expectLevelLow:     true,
-			expectMinMaxTokens: 200,
+			name: "uses default when signature is empty (non-nil)",
+			message: chat.Message{
+				Role:             chat.MessageRoleAssistant,
+				ThoughtSignature: []byte{},
+				ToolCalls: []tools.ToolCall{{
+					ID:       "call-1",
+					Function: tools.FunctionCall{Name: "my_tool", Arguments: `{"key":"value"}`},
+				}},
+			},
+			wantParts: 1,
+			wantSig:   defaultSig,
 		},
 		{
-			name:               "gemini-3.1-pro-preview with thinking budget but disabled via options",
-			model:              "gemini-3.1-pro-preview",
-			thinkingBudget:     &latest.ThinkingBudget{Effort: "high"},
-			expectLevelLow:     true,
-			expectMinMaxTokens: 200,
-		},
-		{
-			name:               "gemini-3.1-flash-preview with thinking budget but disabled via options",
-			model:              "gemini-3.1-flash-preview",
-			thinkingBudget:     &latest.ThinkingBudget{Effort: "medium"},
-			expectLevelLow:     true,
-			expectMinMaxTokens: 200,
+			name: "applies to text and all function call parts",
+			message: chat.Message{
+				Role:    chat.MessageRoleAssistant,
+				Content: "calling tools",
+				ToolCalls: []tools.ToolCall{
+					{ID: "call-1", Function: tools.FunctionCall{Name: "tool_a", Arguments: `{}`}},
+					{ID: "call-2", Function: tools.FunctionCall{Name: "tool_b", Arguments: `{"x":1}`}},
+				},
+			},
+			wantParts: 3, // text + 2 function calls
+			wantSig:   defaultSig,
 		},
 	}
 
@@ -345,75 +362,119 @@ func TestBuildConfig_ThinkingExplicitlyDisabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			// Create ModelOptions with thinking explicitly disabled
-			var modelOpts options.ModelOptions
-			options.WithThinking(false)(&modelOpts)
+			contents := convertMessagesToGemini([]chat.Message{
+				{Role: chat.MessageRoleUser, Content: "go"},
+				tt.message,
+			})
 
-			client := &Client{
-				Config: base.Config{
-					ModelConfig: latest.ModelConfig{
-						Provider:       "google",
-						Model:          tt.model,
-						ThinkingBudget: tt.thinkingBudget,
-					},
-					ModelOptions: modelOpts,
-				},
-			}
+			require.Len(t, contents, 2)
+			assistant := contents[1]
+			assert.Equal(t, genai.RoleModel, assistant.Role)
+			require.Len(t, assistant.Parts, tt.wantParts)
 
-			config := client.buildConfig()
-
-			require.NotNil(t, config.ThinkingConfig, "ThinkingConfig should be explicitly set when thinking is disabled")
-
-			if tt.expectBudgetZero {
-				// Gemini 2.5: fully disabled via ThinkingBudget=0
-				assert.False(t, config.ThinkingConfig.IncludeThoughts, "IncludeThoughts should be false")
-				require.NotNil(t, config.ThinkingConfig.ThinkingBudget, "ThinkingBudget should be set to 0")
-				assert.Equal(t, int32(0), *config.ThinkingConfig.ThinkingBudget, "ThinkingBudget should be 0")
-				assert.Empty(t, config.ThinkingConfig.ThinkingLevel, "ThinkingLevel should be empty")
-			}
-
-			if tt.expectLevelLow {
-				// Gemini 3: cannot fully disable, use lowest level
-				assert.False(t, config.ThinkingConfig.IncludeThoughts, "IncludeThoughts should be false")
-				assert.Equal(t, genai.ThinkingLevelLow, config.ThinkingConfig.ThinkingLevel, "ThinkingLevel should be low")
-				assert.Nil(t, config.ThinkingConfig.ThinkingBudget, "ThinkingBudget should not be set for Gemini 3")
-				assert.GreaterOrEqual(t, config.MaxOutputTokens, tt.expectMinMaxTokens, "MaxOutputTokens should be bumped")
+			for i, p := range assistant.Parts {
+				assert.Equal(t, tt.wantSig, p.ThoughtSignature, "part %d", i)
 			}
 		})
 	}
 }
 
-func TestBuildConfig_ThinkingExplicitlyEnabled(t *testing.T) {
+func TestBuiltInTools(t *testing.T) {
 	t.Parallel()
 
-	// Test that when ModelOptions.Thinking() returns true, thinking is NOT overridden
-	// and the ThinkingBudget from ModelConfig is used.
-	var modelOpts options.ModelOptions
-	options.WithThinking(true)(&modelOpts)
-
-	client := &Client{
-		Config: base.Config{
-			ModelConfig: latest.ModelConfig{
-				Provider:       "google",
-				Model:          "gemini-3-flash-preview",
-				ThinkingBudget: &latest.ThinkingBudget{Effort: "medium"},
-			},
-			ModelOptions: modelOpts,
+	tests := []struct {
+		name         string
+		providerOpts map[string]any
+		wantCount    int
+		wantSearch   bool
+		wantMaps     bool
+		wantCodeExec bool
+	}{
+		{
+			name:         "no built-in tools by default",
+			providerOpts: nil,
+			wantCount:    0,
+		},
+		{
+			name:         "google_search enabled",
+			providerOpts: map[string]any{"google_search": true},
+			wantCount:    1,
+			wantSearch:   true,
+		},
+		{
+			name:         "google_maps enabled",
+			providerOpts: map[string]any{"google_maps": true},
+			wantCount:    1,
+			wantMaps:     true,
+		},
+		{
+			name:         "both enabled",
+			providerOpts: map[string]any{"google_search": true, "google_maps": true},
+			wantCount:    2,
+			wantSearch:   true,
+			wantMaps:     true,
+		},
+		{
+			name:         "explicitly disabled",
+			providerOpts: map[string]any{"google_search": false, "google_maps": false},
+			wantCount:    0,
+		},
+		{
+			name:         "code_execution enabled",
+			providerOpts: map[string]any{"code_execution": true},
+			wantCount:    1,
+			wantCodeExec: true,
+		},
+		{
+			name:         "all three enabled",
+			providerOpts: map[string]any{"google_search": true, "google_maps": true, "code_execution": true},
+			wantCount:    3,
+			wantSearch:   true,
+			wantMaps:     true,
+			wantCodeExec: true,
 		},
 	}
 
-	config := client.buildConfig()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	// ThinkingConfig should be set with IncludeThoughts=true from applyThinkingConfig
-	require.NotNil(t, config.ThinkingConfig, "ThinkingConfig should be set")
-	assert.True(t, config.ThinkingConfig.IncludeThoughts, "IncludeThoughts should be true when thinking is enabled")
-	assert.Equal(t, genai.ThinkingLevelMedium, config.ThinkingConfig.ThinkingLevel, "ThinkingLevel should be set from ThinkingBudget")
+			client := &Client{
+				Config: base.Config{
+					ModelConfig: latest.ModelConfig{
+						Provider:     "google",
+						Model:        "gemini-2.5-flash",
+						ProviderOpts: tt.providerOpts,
+					},
+				},
+			}
+
+			result := client.builtInTools()
+			assert.Len(t, result, tt.wantCount)
+
+			var hasSearch, hasMaps, hasCodeExec bool
+			for _, tool := range result {
+				if tool.GoogleSearch != nil {
+					hasSearch = true
+				}
+				if tool.GoogleMaps != nil {
+					hasMaps = true
+				}
+				if tool.CodeExecution != nil {
+					hasCodeExec = true
+				}
+			}
+			assert.Equal(t, tt.wantSearch, hasSearch, "GoogleSearch")
+			assert.Equal(t, tt.wantMaps, hasMaps, "GoogleMaps")
+			assert.Equal(t, tt.wantCodeExec, hasCodeExec, "CodeExecution")
+		})
+	}
 }
 
-func TestBuildConfig_ThinkingNotSet(t *testing.T) {
+func TestBuildConfig_ThinkingFromBudget(t *testing.T) {
 	t.Parallel()
 
-	// Test that when ModelOptions.Thinking() is nil (not set), behavior falls back to ThinkingBudget
+	// Test that thinking configuration is driven by ThinkingBudget in the model config
 	client := &Client{
 		Config: base.Config{
 			ModelConfig: latest.ModelConfig{
@@ -421,7 +482,6 @@ func TestBuildConfig_ThinkingNotSet(t *testing.T) {
 				Model:          "gemini-3-flash",
 				ThinkingBudget: &latest.ThinkingBudget{Effort: "high"},
 			},
-			// ModelOptions.Thinking() is nil by default
 		},
 	}
 

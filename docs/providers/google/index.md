@@ -48,7 +48,7 @@ models:
 
 Gemini supports two approaches depending on the model version:
 
-<div class="callout callout-warning">
+<div class="callout callout-warning" markdown="1">
 <div class="callout-title">⚠️ Different thinking formats
 </div>
   <p>Gemini 2.5 uses **token-based** budgets (integers). Gemini 3 uses **level-based** budgets (strings like <code>low</code>, <code>high</code>). Make sure you use the right format for your model version.</p>
@@ -89,3 +89,68 @@ models:
     model: gemini-3-flash
     thinking_budget: medium # default for Flash: minimal | low | medium | high
 ```
+
+## Built-in Tools (Grounding)
+
+Gemini models support built-in tools that let the model access Google Search and Google Maps
+directly during generation. Enable them via `provider_opts`:
+
+```yaml
+models:
+  gemini-grounded:
+    provider: google
+    model: gemini-2.5-flash
+    provider_opts:
+      google_search: true
+      google_maps: true
+      code_execution: true
+```
+
+| Option           | Description                                          |
+| ---------------- | ---------------------------------------------------- |
+| `google_search`  | Enables Google Search grounding for up-to-date info  |
+| `google_maps`    | Enables Google Maps grounding for location queries   |
+| `code_execution` | Enables server-side code execution for computations  |
+
+## Vertex AI Model Garden
+
+You can use non-Gemini models (e.g. Claude, Llama) hosted on Google Cloud's
+[Vertex AI Model Garden](https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-partner-models)
+through the `google` provider. When a `publisher` is specified in `provider_opts`,
+requests are routed through Vertex AI's OpenAI-compatible endpoint instead of the
+Gemini SDK.
+
+### Authentication
+
+Vertex AI uses Google Cloud Application Default Credentials (ADC). Make sure you
+are authenticated:
+
+```bash
+gcloud auth application-default login
+```
+
+### Configuration
+
+```yaml
+models:
+  claude-on-vertex:
+    provider: google
+    model: claude-sonnet-4-20250514
+    provider_opts:
+      project: my-gcp-project       # GCP project ID (or set GOOGLE_CLOUD_PROJECT)
+      location: us-east5             # GCP region (or set GOOGLE_CLOUD_LOCATION)
+      publisher: anthropic           # Model publisher (anthropic, meta, etc.)
+```
+
+| Option      | Description                                                                          |
+| ----------- | ------------------------------------------------------------------------------------ |
+| `project`   | GCP project ID. Falls back to `GOOGLE_CLOUD_PROJECT` env var                         |
+| `location`  | GCP region (e.g. `us-east5`, `us-central1`). Falls back to `GOOGLE_CLOUD_LOCATION`   |
+| `publisher`  | Model publisher (e.g. `anthropic`, `meta`, `mistral`). Must not be `google`          |
+
+<div class="callout callout-info">
+<div class="callout-title">ℹ️ Gemini models on Vertex AI
+</div>
+  <p>Setting <code>publisher: google</code> (or omitting <code>publisher</code>) uses the native Gemini SDK path. The Model Garden endpoint is only used for non-Google publishers.</p>
+
+</div>

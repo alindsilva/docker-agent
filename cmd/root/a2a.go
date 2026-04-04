@@ -35,10 +35,13 @@ func newA2ACmd() *cobra.Command {
 	return cmd
 }
 
-func (f *a2aFlags) runA2ACommand(cmd *cobra.Command, args []string) error {
-	telemetry.TrackCommand("serve", append([]string{"a2a"}, args...))
-
+func (f *a2aFlags) runA2ACommand(cmd *cobra.Command, args []string) (commandErr error) {
 	ctx := cmd.Context()
+	telemetry.TrackCommand(ctx, "serve", append([]string{"a2a"}, args...))
+	defer func() { // do not inline this defer so that commandErr is not resolved early
+		telemetry.TrackCommandError(ctx, "serve", append([]string{"a2a"}, args...), commandErr)
+	}()
+
 	out := cli.NewPrinter(cmd.OutOrStdout())
 	agentFilename := args[0]
 

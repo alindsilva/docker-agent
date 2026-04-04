@@ -2,7 +2,6 @@ package spinner
 
 import (
 	"math/rand/v2"
-	"os"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -24,6 +23,8 @@ type Spinner interface {
 	layout.Model
 	Reset() Spinner
 	Stop()
+	// RawFrame returns the current spinner character without any styling applied.
+	RawFrame() string
 }
 type spinner struct {
 	animSub             *animation.Subscription // manages animation tick subscription
@@ -137,38 +138,13 @@ func (s *spinner) Stop() {
 	s.animSub.Stop()
 }
 
+// RawFrame returns the current spinner character without any styling applied.
+func (s *spinner) RawFrame() string {
+	return spinnerFrames[s.frame%len(spinnerFrames)]
+}
+
 // spinnerFrames holds the animation frames for the current terminal.
-// Braille characters are used by default; inside tmux they don't render
-// correctly, so we fall back to ASCII.
-var spinnerFrames = selectFrames(inMultiplexer())
-
-// inMultiplexer reports whether the process is running inside a terminal
-// multiplexer (tmux, screen). Detection checks multiple env vars because
-// some of them may be stripped in containers or sudo sessions.
-func inMultiplexer() bool {
-	if os.Getenv("TMUX") != "" {
-		return true
-	}
-	if os.Getenv("STY") != "" { // GNU screen
-		return true
-	}
-	term := os.Getenv("TERM")
-	return strings.HasPrefix(term, "tmux") || strings.HasPrefix(term, "screen")
-}
-
-var (
-	brailleFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	asciiFrames   = []string{"|", "/", "-", "\\"}
-)
-
-// selectFrames returns ASCII spinner frames when inTmux is true,
-// braille frames otherwise.
-func selectFrames(inTmux bool) []string {
-	if inTmux {
-		return asciiFrames
-	}
-	return brailleFrames
-}
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // Frame returns the spinner character for the given animation frame.
 func Frame(index int) string {

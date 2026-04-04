@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,12 +16,9 @@ import (
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/model/provider/base"
+	"github.com/docker/docker-agent/pkg/modelerrors"
 	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/permissions"
-	"github.com/docker/docker-agent/pkg/rag"
-	"github.com/docker/docker-agent/pkg/rag/database"
-	"github.com/docker/docker-agent/pkg/rag/strategy"
-	ragtypes "github.com/docker/docker-agent/pkg/rag/types"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/team"
 	"github.com/docker/docker-agent/pkg/tools"
@@ -276,17 +272,18 @@ func TestSimple(t *testing.T) {
 	require.Equal(t, chat.MessageRoleAssistant, msgAdded.Message.Message.Role)
 
 	expectedEvents := []Event{
-		AgentInfo("root", "test/mock-model", "", ""),
 		TeamInfo([]AgentDetails{{Name: "root", Provider: "test", Model: "mock-model"}}, "root"),
 		ToolsetInfo(0, false, "root"),
 		UserMessage("Hi", sess.ID, nil, 0),
 		StreamStarted(sess.ID, "root"),
 		ToolsetInfo(0, false, "root"),
+		AgentInfo("root", "test/mock-model", "", ""),
 		AgentChoice("root", sess.ID, "Hello"),
 		MessageAdded(sess.ID, msgAdded.Message, "root"),
 		NewTokenUsageEvent(sess.ID, "root", &Usage{InputTokens: 3, OutputTokens: 2, ContextLength: 5, LastMessage: &MessageUsage{
-			Usage: chat.Usage{InputTokens: 3, OutputTokens: 2},
-			Model: "test/mock-model",
+			Usage:        chat.Usage{InputTokens: 3, OutputTokens: 2},
+			Model:        "test/mock-model",
+			FinishReason: chat.FinishReasonStop,
 		}}),
 		StreamStopped(sess.ID, "root"),
 	}
@@ -315,12 +312,12 @@ func TestMultipleContentChunks(t *testing.T) {
 	require.NotNil(t, msgAdded.Message)
 
 	expectedEvents := []Event{
-		AgentInfo("root", "test/mock-model", "", ""),
 		TeamInfo([]AgentDetails{{Name: "root", Provider: "test", Model: "mock-model"}}, "root"),
 		ToolsetInfo(0, false, "root"),
 		UserMessage("Please greet me", sess.ID, nil, 0),
 		StreamStarted(sess.ID, "root"),
 		ToolsetInfo(0, false, "root"),
+		AgentInfo("root", "test/mock-model", "", ""),
 		AgentChoice("root", sess.ID, "Hello "),
 		AgentChoice("root", sess.ID, "there, "),
 		AgentChoice("root", sess.ID, "how "),
@@ -328,8 +325,9 @@ func TestMultipleContentChunks(t *testing.T) {
 		AgentChoice("root", sess.ID, "you?"),
 		MessageAdded(sess.ID, msgAdded.Message, "root"),
 		NewTokenUsageEvent(sess.ID, "root", &Usage{InputTokens: 8, OutputTokens: 12, ContextLength: 20, LastMessage: &MessageUsage{
-			Usage: chat.Usage{InputTokens: 8, OutputTokens: 12},
-			Model: "test/mock-model",
+			Usage:        chat.Usage{InputTokens: 8, OutputTokens: 12},
+			Model:        "test/mock-model",
+			FinishReason: chat.FinishReasonStop,
 		}}),
 		StreamStopped(sess.ID, "root"),
 	}
@@ -356,19 +354,20 @@ func TestWithReasoning(t *testing.T) {
 	require.NotNil(t, msgAdded.Message)
 
 	expectedEvents := []Event{
-		AgentInfo("root", "test/mock-model", "", ""),
 		TeamInfo([]AgentDetails{{Name: "root", Provider: "test", Model: "mock-model"}}, "root"),
 		ToolsetInfo(0, false, "root"),
 		UserMessage("Hi", sess.ID, nil, 0),
 		StreamStarted(sess.ID, "root"),
 		ToolsetInfo(0, false, "root"),
+		AgentInfo("root", "test/mock-model", "", ""),
 		AgentChoiceReasoning("root", sess.ID, "Let me think about this..."),
 		AgentChoiceReasoning("root", sess.ID, " I should respond politely."),
 		AgentChoice("root", sess.ID, "Hello, how can I help you?"),
 		MessageAdded(sess.ID, msgAdded.Message, "root"),
 		NewTokenUsageEvent(sess.ID, "root", &Usage{InputTokens: 10, OutputTokens: 15, ContextLength: 25, LastMessage: &MessageUsage{
-			Usage: chat.Usage{InputTokens: 10, OutputTokens: 15},
-			Model: "test/mock-model",
+			Usage:        chat.Usage{InputTokens: 10, OutputTokens: 15},
+			Model:        "test/mock-model",
+			FinishReason: chat.FinishReasonStop,
 		}}),
 		StreamStopped(sess.ID, "root"),
 	}
@@ -396,20 +395,21 @@ func TestMixedContentAndReasoning(t *testing.T) {
 	require.NotNil(t, msgAdded.Message)
 
 	expectedEvents := []Event{
-		AgentInfo("root", "test/mock-model", "", ""),
 		TeamInfo([]AgentDetails{{Name: "root", Provider: "test", Model: "mock-model"}}, "root"),
 		ToolsetInfo(0, false, "root"),
 		UserMessage("Hi there", sess.ID, nil, 0),
 		StreamStarted(sess.ID, "root"),
 		ToolsetInfo(0, false, "root"),
+		AgentInfo("root", "test/mock-model", "", ""),
 		AgentChoiceReasoning("root", sess.ID, "The user wants a greeting"),
 		AgentChoice("root", sess.ID, "Hello!"),
 		AgentChoiceReasoning("root", sess.ID, " I should be friendly"),
 		AgentChoice("root", sess.ID, " How can I help you today?"),
 		MessageAdded(sess.ID, msgAdded.Message, "root"),
 		NewTokenUsageEvent(sess.ID, "root", &Usage{InputTokens: 15, OutputTokens: 20, ContextLength: 35, LastMessage: &MessageUsage{
-			Usage: chat.Usage{InputTokens: 15, OutputTokens: 20},
-			Model: "test/mock-model",
+			Usage:        chat.Usage{InputTokens: 15, OutputTokens: 20},
+			Model:        "test/mock-model",
+			FinishReason: chat.FinishReasonStop,
 		}}),
 		StreamStopped(sess.ID, "root"),
 	}
@@ -454,12 +454,12 @@ func TestErrorEvent(t *testing.T) {
 	}
 
 	require.Len(t, events, 8)
-	require.IsType(t, &AgentInfoEvent{}, events[0])
-	require.IsType(t, &TeamInfoEvent{}, events[1])
-	require.IsType(t, &ToolsetInfoEvent{}, events[2])
-	require.IsType(t, &UserMessageEvent{}, events[3])
-	require.IsType(t, &StreamStartedEvent{}, events[4])
-	require.IsType(t, &ToolsetInfoEvent{}, events[5])
+	require.IsType(t, &TeamInfoEvent{}, events[0])
+	require.IsType(t, &ToolsetInfoEvent{}, events[1])
+	require.IsType(t, &UserMessageEvent{}, events[2])
+	require.IsType(t, &StreamStartedEvent{}, events[3])
+	require.IsType(t, &ToolsetInfoEvent{}, events[4])
+	require.IsType(t, &AgentInfoEvent{}, events[5])
 	require.IsType(t, &ErrorEvent{}, events[6])
 	require.IsType(t, &StreamStoppedEvent{}, events[7])
 
@@ -493,112 +493,12 @@ func TestContextCancellation(t *testing.T) {
 		events = append(events, ev)
 	}
 
-	require.GreaterOrEqual(t, len(events), 5)
-	require.IsType(t, &AgentInfoEvent{}, events[0])
-	require.IsType(t, &TeamInfoEvent{}, events[1])
-	require.IsType(t, &ToolsetInfoEvent{}, events[2])
-	require.IsType(t, &UserMessageEvent{}, events[3])
-	require.IsType(t, &StreamStartedEvent{}, events[4])
+	require.GreaterOrEqual(t, len(events), 4)
+	require.IsType(t, &TeamInfoEvent{}, events[0])
+	require.IsType(t, &ToolsetInfoEvent{}, events[1])
+	require.IsType(t, &UserMessageEvent{}, events[2])
+	require.IsType(t, &StreamStartedEvent{}, events[3])
 	require.IsType(t, &StreamStoppedEvent{}, events[len(events)-1])
-}
-
-// stubRAGStrategy is a minimal implementation of strategy.Strategy for testing RAG initialization.
-type stubRAGStrategy struct{}
-
-func (s *stubRAGStrategy) Initialize(_ context.Context, _ []string, _ strategy.ChunkingConfig) error {
-	return nil
-}
-
-func (s *stubRAGStrategy) Query(_ context.Context, _ string, _ int, _ float64) ([]database.SearchResult, error) {
-	return nil, nil
-}
-
-func (s *stubRAGStrategy) CheckAndReindexChangedFiles(_ context.Context, _ []string, _ strategy.ChunkingConfig) error {
-	return nil
-}
-
-func (s *stubRAGStrategy) StartFileWatcher(_ context.Context, _ []string, _ strategy.ChunkingConfig) error {
-	return nil
-}
-
-func (s *stubRAGStrategy) Close() error { return nil }
-
-func TestStartBackgroundRAGInit_StopsForwardingAfterContextCancel(t *testing.T) {
-	t.Parallel()
-
-	baseCtx := t.Context()
-	ctx, cancel := context.WithCancel(baseCtx)
-	defer cancel()
-
-	// Build a RAG manager with a stub strategy and a controllable event channel.
-	strategyEvents := make(chan ragtypes.Event, 10)
-	mgr, err := rag.New(
-		ctx,
-		"test-rag",
-		rag.Config{
-			StrategyConfigs: []strategy.Config{
-				{
-					Name:     "stub",
-					Strategy: &stubRAGStrategy{},
-					Docs:     nil,
-				},
-			},
-		},
-		strategyEvents,
-	)
-	require.NoError(t, err)
-	defer func() {
-		_ = mgr.Close()
-	}()
-
-	tm := team.New(team.WithRAGManagers(map[string]*rag.Manager{
-		"default": mgr,
-	}))
-
-	rt := &LocalRuntime{
-		team:         tm,
-		currentAgent: "root",
-	}
-
-	eventsCh := make(chan Event, 10)
-
-	// Start background RAG init with event forwarding.
-	rt.StartBackgroundRAGInit(ctx, func(ev Event) {
-		eventsCh <- ev
-	})
-
-	// Emit an "indexing_completed" event and ensure it is forwarded.
-	strategyEvents <- ragtypes.Event{
-		Type:         ragtypes.EventTypeIndexingComplete,
-		StrategyName: "stub",
-	}
-
-	select {
-	case <-eventsCh:
-		// ok: at least one event forwarded
-	case <-time.After(100 * time.Millisecond):
-		t.Fatalf("expected RAG event to be forwarded before cancellation")
-	}
-
-	// Cancel the context and ensure no further events are forwarded.
-	cancel()
-
-	// Brief yield to allow the forwarder goroutine to observe cancellation.
-	// This is a timing-based negative test: we verify no event is forwarded.
-	time.Sleep(10 * time.Millisecond)
-
-	// Emit another event; it should NOT be forwarded.
-	strategyEvents <- ragtypes.Event{
-		Type:         ragtypes.EventTypeIndexingComplete,
-		StrategyName: "stub",
-	}
-
-	select {
-	case ev := <-eventsCh:
-		t.Fatalf("expected no events after cancellation, got %T", ev)
-	case <-time.After(20 * time.Millisecond):
-		// success: no events forwarded
-	}
 }
 
 func TestToolCallVariations(t *testing.T) {
@@ -682,6 +582,7 @@ func (p *queueProvider) MaxTokens() int { return 0 }
 
 type mockModelStoreWithLimit struct {
 	ModelStore
+
 	limit int
 }
 
@@ -733,6 +634,55 @@ func TestCompaction(t *testing.T) {
 	}
 
 	require.NotEqual(t, -1, compactionStartIdx, "expected a SessionCompaction start event")
+}
+
+// errorProvider always returns the configured error from CreateChatCompletionStream.
+type errorProvider struct {
+	id  string
+	err error
+}
+
+func (p *errorProvider) ID() string { return p.id }
+
+func (p *errorProvider) CreateChatCompletionStream(context.Context, []chat.Message, []tools.Tool) (chat.MessageStream, error) {
+	return nil, p.err
+}
+
+func (p *errorProvider) BaseConfig() base.Config { return base.Config{} }
+
+func (p *errorProvider) MaxTokens() int { return 0 }
+
+func TestCompactionOverflowDoesNotLoop(t *testing.T) {
+	// The model always returns a ContextOverflowError. Without the
+	// max-retry guard this would loop forever because compaction
+	// cannot fix the problem.
+	overflowErr := modelerrors.NewContextOverflowError(errors.New("prompt is too long"))
+	prov := &errorProvider{id: "test/overflow-model", err: overflowErr}
+
+	root := agent.New("root", "You are a test agent", agent.WithModel(prov))
+	tm := team.New(team.WithAgents(root))
+
+	rt, err := NewLocalRuntime(tm, WithSessionCompaction(true), WithModelStore(mockModelStoreWithLimit{limit: 100}))
+	require.NoError(t, err)
+
+	sess := session.New(session.WithUserMessage("Hello"))
+	events := rt.RunStream(t.Context(), sess)
+
+	var compactionCount int
+	var sawError bool
+	for ev := range events {
+		if e, ok := ev.(*SessionCompactionEvent); ok && e.Status == "started" {
+			compactionCount++
+		}
+		if _, ok := ev.(*ErrorEvent); ok {
+			sawError = true
+		}
+	}
+
+	// Compaction should have been attempted at most once, then the loop
+	// must give up and surface an error instead of retrying indefinitely.
+	require.LessOrEqual(t, compactionCount, 1, "expected at most 1 compaction attempt, got %d", compactionCount)
+	require.True(t, sawError, "expected an ErrorEvent after exhausting compaction retries")
 }
 
 func TestSessionWithoutUserMessage(t *testing.T) {
@@ -839,37 +789,6 @@ func TestNewRuntime_InvalidCurrentAgentError(t *testing.T) {
 	// Ask for a non-existent current agent
 	_, err := New(tm, WithCurrentAgent("other"), WithModelStore(mockModelStore{}))
 	require.Contains(t, err.Error(), "agent not found: other (available agents: root)")
-}
-
-func TestSummarize_EmptySession(t *testing.T) {
-	prov := &mockProvider{id: "test/mock-model", stream: &mockStream{}}
-	root := agent.New("root", "You are a test agent", agent.WithModel(prov))
-	tm := team.New(team.WithAgents(root))
-
-	rt, err := NewLocalRuntime(tm, WithSessionCompaction(false), WithModelStore(mockModelStore{}))
-	require.NoError(t, err)
-
-	sess := session.New()
-	sess.Title = "Empty Session Test"
-
-	// Try to summarize the empty session
-	events := make(chan Event, 10)
-	rt.Summarize(t.Context(), sess, "", events)
-	close(events)
-
-	// Collect events
-	var warningFound bool
-	var warningMsg string
-	for ev := range events {
-		if warningEvent, ok := ev.(*WarningEvent); ok {
-			warningFound = true
-			warningMsg = warningEvent.Message
-		}
-	}
-
-	// Should have received a warning event about empty session
-	require.True(t, warningFound, "expected a warning event for empty session")
-	require.Contains(t, warningMsg, "empty", "warning message should mention empty session")
 }
 
 func TestProcessToolCalls_UnknownTool_ReturnsErrorResponse(t *testing.T) {
@@ -1065,6 +984,59 @@ func TestEmitStartupInfo_CostIncludesSubSessions(t *testing.T) {
 	// Cost must equal TotalCost (0.01 + 0.05 = 0.06), not OwnCost (0.01).
 	assert.InDelta(t, 0.06, tokenEvent.Usage.Cost, 0.0001,
 		"cost should include sub-session costs (TotalCost, not OwnCost)")
+}
+
+func TestEmitStartupInfo_LastMessageFinishReason(t *testing.T) {
+	// When restoring a session whose last assistant message has a
+	// FinishReason, the emitted TokenUsageEvent.LastMessage must carry
+	// that FinishReason so the UI can identify the final response.
+	prov := &mockProvider{id: "test/startup-model", stream: &mockStream{}}
+	root := agent.New("root", "agent",
+		agent.WithModel(prov),
+		agent.WithDescription("Root"),
+	)
+	tm := team.New(team.WithAgents(root))
+
+	rt, err := NewLocalRuntime(tm, WithCurrentAgent("root"),
+		WithModelStore(mockModelStoreWithLimit{limit: 128_000}))
+	require.NoError(t, err)
+
+	sess := session.New()
+	sess.InputTokens = 500
+	sess.OutputTokens = 200
+
+	sess.Messages = append(sess.Messages, session.Item{
+		Message: &session.Message{
+			AgentName: "root",
+			Message: chat.Message{
+				Role:         chat.MessageRoleAssistant,
+				Content:      "final answer",
+				Cost:         0.02,
+				Model:        "test/startup-model",
+				FinishReason: chat.FinishReasonStop,
+				Usage:        &chat.Usage{InputTokens: 500, OutputTokens: 200},
+			},
+		},
+	})
+
+	events := make(chan Event, 20)
+	rt.EmitStartupInfo(t.Context(), sess, events)
+	close(events)
+
+	var tokenEvent *TokenUsageEvent
+	for event := range events {
+		if te, ok := event.(*TokenUsageEvent); ok {
+			tokenEvent = te
+		}
+	}
+
+	require.NotNil(t, tokenEvent, "should emit TokenUsageEvent")
+	require.NotNil(t, tokenEvent.Usage.LastMessage, "LastMessage should be populated on session restore")
+	assert.Equal(t, chat.FinishReasonStop, tokenEvent.Usage.LastMessage.FinishReason)
+	assert.Equal(t, "test/startup-model", tokenEvent.Usage.LastMessage.Model)
+	assert.InDelta(t, 0.02, tokenEvent.Usage.LastMessage.Cost, 0.0001)
+	assert.Equal(t, int64(500), tokenEvent.Usage.LastMessage.InputTokens)
+	assert.Equal(t, int64(200), tokenEvent.Usage.LastMessage.OutputTokens)
 }
 
 func TestEmitStartupInfo_NilSessionNoTokenEvent(t *testing.T) {
@@ -1928,4 +1900,53 @@ func TestProcessToolCalls_UsesPinnedAgent(t *testing.T) {
 				"event %T should reference pinned agent \"worker\", not root", ev)
 		}
 	}
+}
+
+func TestFilterExcludedTools(t *testing.T) {
+	allTools := []tools.Tool{
+		{Name: "read_skill"},
+		{Name: "run_skill"},
+		{Name: "shell"},
+	}
+
+	t.Run("no exclusions returns all tools", func(t *testing.T) {
+		result := filterExcludedTools(allTools, nil)
+		assert.Len(t, result, 3)
+	})
+
+	t.Run("excludes run_skill", func(t *testing.T) {
+		result := filterExcludedTools(allTools, []string{"run_skill"})
+		assert.Len(t, result, 2)
+		for _, tool := range result {
+			assert.NotEqual(t, "run_skill", tool.Name)
+		}
+	})
+
+	t.Run("excludes multiple tools", func(t *testing.T) {
+		result := filterExcludedTools(allTools, []string{"run_skill", "shell"})
+		assert.Len(t, result, 1)
+		assert.Equal(t, "read_skill", result[0].Name)
+	})
+}
+
+func TestMergeExcludedTools(t *testing.T) {
+	t.Run("both empty", func(t *testing.T) {
+		assert.Nil(t, mergeExcludedTools(nil, nil))
+	})
+
+	t.Run("parent only", func(t *testing.T) {
+		result := mergeExcludedTools([]string{"run_skill"}, nil)
+		assert.Equal(t, []string{"run_skill"}, result)
+	})
+
+	t.Run("child only", func(t *testing.T) {
+		result := mergeExcludedTools(nil, []string{"run_skill"})
+		assert.Equal(t, []string{"run_skill"}, result)
+	})
+
+	t.Run("deduplicates", func(t *testing.T) {
+		result := mergeExcludedTools([]string{"run_skill", "shell"}, []string{"run_skill", "read_skill"})
+		assert.Len(t, result, 3)
+		assert.ElementsMatch(t, []string{"run_skill", "shell", "read_skill"}, result)
+	})
 }

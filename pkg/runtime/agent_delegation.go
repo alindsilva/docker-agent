@@ -58,6 +58,168 @@ func buildTaskSystemMessage(task, expectedOutput string) string {
 	return msg
 }
 
+// SubSessionConfig describes how to build and run a child session.
+// Both handleTaskTransfer and RunAgent (background agents) use this
+// to avoid duplicating session-construction logic. Future callers
+// (e.g. skill-as-sub-agent) can use it as well.
+type SubSessionConfig struct {
+	// Task is the user-facing task description.
+	Task string
+	// ExpectedOutput is an optional description of what the sub-agent should produce.
+	ExpectedOutput string
+	// SystemMessage, when non-empty, replaces the default task-based system
+	// message. This is used by skill sub-agents whose system prompt is the
+	// skill content itself rather than the team delegation boilerplate.
+	SystemMessage string
+	// AgentName is the name of the agent that will execute the sub-session.
+	AgentName string
+	// Title is a human-readable label for the sub-session (e.g. "Transferred task").
+	Title string
+	// ToolsApproved overrides whether tools are pre-approved in the child session.
+	ToolsApproved bool
+	// PinAgent, when true, pins the child session to AgentName via
+	// session.WithAgentName. This is required for concurrent background
+	// tasks that must not share the runtime's mutable currentAgent field.
+	PinAgent bool
+	// ImplicitUserMessage, when non-empty, overrides the default "Please proceed."
+	// user message sent to the child session. This allows callers like skill
+	// sub-agents to pass the task description as the user message.
+	ImplicitUserMessage string
+	// ExcludedTools lists tool names that should be filtered out of the agent's
+	// tool list for the child session. This prevents recursive tool calls
+	// (e.g. run_skill calling itself in a skill sub-session).
+	ExcludedTools []string
+}
+
+// newSubSession builds a *session.Session from a SubSessionConfig and a parent
+// session. It consolidates the session options that were previously duplicated
+// across handleTaskTransfer and RunAgent.
+func newSubSession(parent *session.Session, cfg SubSessionConfig, childAgent *agent.Agent) *session.Session {
+	sysMsg := cfg.SystemMessage
+	if sysMsg == "" {
+		sysMsg = buildTaskSystemMessage(cfg.Task, cfg.ExpectedOutput)
+	}
+
+	userMsg := cfg.ImplicitUserMessage
+	if userMsg == "" {
+		userMsg = "Please proceed."
+	}
+
+	opts := []session.Opt{
+		session.WithSystemMessage(sysMsg),
+		session.WithImplicitUserMessage(userMsg),
+		session.WithMaxIterations(childAgent.MaxIterations()),
+		session.WithMaxConsecutiveToolCalls(childAgent.MaxConsecutiveToolCalls()),
+		session.WithMaxOldToolCallTokens(childAgent.MaxOldToolCallTokens()),
+		session.WithTitle(cfg.Title),
+		session.WithToolsApproved(cfg.ToolsApproved),
+		session.WithSendUserMessage(false),
+		session.WithParentID(parent.ID),
+	}
+	if cfg.PinAgent {
+		opts = append(opts, session.WithAgentName(cfg.AgentName))
+	}
+	// Merge parent's excluded tools with config's excluded tools so that
+	// nested sub-sessions (e.g. skill → transfer_task → child) inherit
+	// exclusions from all ancestors and don't re-introduce filtered tools.
+	excludedTools := mergeExcludedTools(parent.ExcludedTools, cfg.ExcludedTools)
+	if len(excludedTools) > 0 {
+		opts = append(opts, session.WithExcludedTools(excludedTools))
+	}
+	return session.New(opts...)
+}
+
+// mergeExcludedTools combines two excluded-tool lists, deduplicating entries.
+// It returns nil when both inputs are empty.
+func mergeExcludedTools(parent, child []string) []string {
+	if len(parent) == 0 {
+		return child
+	}
+	if len(child) == 0 {
+		return parent
+	}
+	set := make(map[string]struct{}, len(parent)+len(child))
+	for _, t := range parent {
+		set[t] = struct{}{}
+	}
+	for _, t := range child {
+		set[t] = struct{}{}
+	}
+	merged := make([]string, 0, len(set))
+	for t := range set {
+		merged = append(merged, t)
+	}
+	return merged
+}
+
+// runSubSessionForwarding runs a child session within the parent, forwarding all
+// events to the caller's event channel and propagating tool approval state
+// back to the parent when done.
+//
+// This is the "interactive" path used by transfer_task where the parent agent
+// loop is blocked while the child executes.
+func (r *LocalRuntime) runSubSessionForwarding(ctx context.Context, parent, child *session.Session, span trace.Span, evts chan Event, callerAgent string) (*tools.ToolCallResult, error) {
+	childEvents := r.RunStream(ctx, child)
+	for event := range childEvents {
+		evts <- event
+		if errEvent, ok := event.(*ErrorEvent); ok {
+			// Drain remaining events (including StreamStoppedEvent) so the
+			// TUI's streamDepth counter stays balanced.
+			for remaining := range childEvents {
+				evts <- remaining
+			}
+			span.RecordError(fmt.Errorf("%s", errEvent.Error))
+			span.SetStatus(codes.Error, "sub-session error")
+			return nil, fmt.Errorf("%s", errEvent.Error)
+		}
+	}
+
+	parent.ToolsApproved = child.ToolsApproved
+
+	parent.AddSubSession(child)
+	evts <- SubSessionCompleted(parent.ID, child, callerAgent)
+
+	span.SetStatus(codes.Ok, "sub-session completed")
+	return tools.ResultSuccess(child.GetLastAssistantMessageContent()), nil
+}
+
+// runSubSessionCollecting runs a child session, collecting output via an
+// optional content callback instead of forwarding events. This is the path
+// used by background agents and other non-interactive callers.
+//
+// It returns a RunResult containing either the final assistant message or
+// an error message.
+func (r *LocalRuntime) runSubSessionCollecting(ctx context.Context, parent, child *session.Session, onContent func(string)) *agenttool.RunResult {
+	var errMsg string
+	events := r.RunStream(ctx, child)
+	for event := range events {
+		if ctx.Err() != nil {
+			break
+		}
+		if choice, ok := event.(*AgentChoiceEvent); ok && choice.Content != "" {
+			if onContent != nil {
+				onContent(choice.Content)
+			}
+		}
+		if errEvt, ok := event.(*ErrorEvent); ok {
+			errMsg = errEvt.Error
+			break
+		}
+	}
+	// Drain remaining events so the RunStream goroutine can complete
+	// and close the channel without blocking on a full buffer.
+	for range events {
+	}
+
+	if errMsg != "" {
+		return &agenttool.RunResult{ErrMsg: errMsg}
+	}
+
+	result := child.GetLastAssistantMessageContent()
+	parent.AddSubSession(child)
+	return &agenttool.RunResult{Result: result}
+}
+
 // CurrentAgentSubAgentNames implements agenttool.Runner.
 func (r *LocalRuntime) CurrentAgentSubAgentNames() []string {
 	a := r.CurrentAgent()
@@ -85,46 +247,18 @@ func (r *LocalRuntime) RunAgent(ctx context.Context, params agenttool.RunParams)
 	//
 	// TODO: propagate the parent session's per-tool permission rules once the runtime
 	// supports per-session permission scoping rather than a single shared ToolsApproved flag.
-	s := session.New(
-		session.WithSystemMessage(buildTaskSystemMessage(params.Task, params.ExpectedOutput)),
-		session.WithImplicitUserMessage("Please proceed."),
-		session.WithMaxIterations(child.MaxIterations()),
-		session.WithTitle("Background agent task"),
-		session.WithToolsApproved(true),
-		session.WithThinking(sess.Thinking),
-		session.WithSendUserMessage(false),
-		session.WithParentID(sess.ID),
-		session.WithAgentName(params.AgentName),
-	)
-
-	var errMsg string
-	events := r.RunStream(ctx, s)
-	for event := range events {
-		if ctx.Err() != nil {
-			break
-		}
-		if choice, ok := event.(*AgentChoiceEvent); ok && choice.Content != "" {
-			if params.OnContent != nil {
-				params.OnContent(choice.Content)
-			}
-		}
-		if errEvt, ok := event.(*ErrorEvent); ok {
-			errMsg = errEvt.Error
-			break
-		}
-	}
-	// Drain remaining events so the RunStream goroutine can complete
-	// and close the channel without blocking on a full buffer.
-	for range events {
+	cfg := SubSessionConfig{
+		Task:           params.Task,
+		ExpectedOutput: params.ExpectedOutput,
+		AgentName:      params.AgentName,
+		Title:          "Background agent task",
+		ToolsApproved:  true,
+		PinAgent:       true,
 	}
 
-	if errMsg != "" {
-		return &agenttool.RunResult{ErrMsg: errMsg}
-	}
+	s := newSubSession(sess, cfg, child)
 
-	result := s.GetLastAssistantMessageContent()
-	sess.AddSubSession(s)
-	return &agenttool.RunResult{Result: result}
+	return r.runSubSessionCollecting(ctx, sess, s, params.OnContent)
 }
 
 func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Session, toolCall tools.ToolCall, evts chan Event) (*tools.ToolCallResult, error) {
@@ -154,70 +288,40 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 
 	slog.Debug("Transferring task to agent", "from_agent", a.Name(), "to_agent", params.Agent, "task", params.Task)
 
-	ca := r.CurrentAgentName()
-
 	// Emit agent switching start event
-	evts <- AgentSwitching(true, ca, params.Agent)
+	evts <- AgentSwitching(true, a.Name(), params.Agent)
 
 	r.setCurrentAgent(params.Agent)
 	defer func() {
-		r.setCurrentAgent(ca)
+		r.setCurrentAgent(a.Name())
 
 		// Emit agent switching end event
-		evts <- AgentSwitching(false, params.Agent, ca)
+		evts <- AgentSwitching(false, params.Agent, a.Name())
 
 		// Restore original agent info in sidebar
-		if originalAgent, err := r.team.Agent(ca); err == nil {
-			evts <- AgentInfo(originalAgent.Name(), getAgentModelID(originalAgent), originalAgent.Description(), originalAgent.WelcomeMessage())
-		}
+		evts <- AgentInfo(a.Name(), getAgentModelID(a), a.Description(), a.WelcomeMessage())
 	}()
 
 	// Emit agent info for the new agent
-	if newAgent, err := r.team.Agent(params.Agent); err == nil {
-		evts <- AgentInfo(newAgent.Name(), getAgentModelID(newAgent), newAgent.Description(), newAgent.WelcomeMessage())
-	}
-
-	slog.Debug("Creating new session with parent session", "parent_session_id", sess.ID, "tools_approved", sess.ToolsApproved, "thinking", sess.Thinking)
-
 	child, err := r.team.Agent(params.Agent)
 	if err != nil {
 		return nil, err
 	}
+	evts <- AgentInfo(child.Name(), getAgentModelID(child), child.Description(), child.WelcomeMessage())
 
-	s := session.New(
-		session.WithSystemMessage(buildTaskSystemMessage(params.Task, params.ExpectedOutput)),
-		session.WithImplicitUserMessage("Please proceed."),
-		session.WithMaxIterations(child.MaxIterations()),
-		session.WithTitle("Transferred task"),
-		session.WithToolsApproved(sess.ToolsApproved),
-		session.WithThinking(sess.Thinking),
-		session.WithSendUserMessage(false),
-		session.WithParentID(sess.ID),
-	)
+	slog.Debug("Creating new session with parent session", "parent_session_id", sess.ID, "tools_approved", sess.ToolsApproved)
 
-	return r.runSubSession(ctx, sess, s, span, evts, a.Name())
-}
-
-// runSubSession runs a child session within the parent, forwarding events and
-// propagating state (tool approvals, thinking) back to the parent when done.
-func (r *LocalRuntime) runSubSession(ctx context.Context, parent, child *session.Session, span trace.Span, evts chan Event, agentName string) (*tools.ToolCallResult, error) {
-	for event := range r.RunStream(ctx, child) {
-		evts <- event
-		if errEvent, ok := event.(*ErrorEvent); ok {
-			span.RecordError(fmt.Errorf("%s", errEvent.Error))
-			span.SetStatus(codes.Error, "sub-session error")
-			return nil, fmt.Errorf("%s", errEvent.Error)
-		}
+	cfg := SubSessionConfig{
+		Task:           params.Task,
+		ExpectedOutput: params.ExpectedOutput,
+		AgentName:      params.Agent,
+		Title:          "Transferred task",
+		ToolsApproved:  sess.ToolsApproved,
 	}
 
-	parent.ToolsApproved = child.ToolsApproved
-	parent.Thinking = child.Thinking
+	s := newSubSession(sess, cfg, child)
 
-	parent.AddSubSession(child)
-	evts <- SubSessionCompleted(parent.ID, child, agentName)
-
-	span.SetStatus(codes.Ok, "sub-session completed")
-	return tools.ResultSuccess(child.GetLastAssistantMessageContent()), nil
+	return r.runSubSessionForwarding(ctx, sess, s, span, evts, a.Name())
 }
 
 func (r *LocalRuntime) handleHandoff(_ context.Context, _ *session.Session, toolCall tools.ToolCall, _ chan Event) (*tools.ToolCallResult, error) {

@@ -59,9 +59,9 @@
     },
     "rag": {
       "type": "object",
-      "description": "Map of RAG (Retrieval-Augmented Generation) configurations",
+      "description": "Map of reusable RAG source definitions. Define RAG sources here and reference them by name from agent toolsets to avoid duplication.",
       "additionalProperties": {
-        "$ref": "#/definitions/RAGConfig"
+        "$ref": "#/definitions/RAGToolset"
       }
     },
     "metadata": {
@@ -170,14 +170,14 @@
         },
         "sub_agents": {
           "type": "array",
-          "description": "List of sub-agents. Can be names of agents defined in this config or external references (OCI images like 'namespace/repo' or URLs).",
+          "description": "List of sub-agents. Can be names of agents defined in this config, external references (OCI images like 'namespace/repo' or URLs), or named external references using 'name:reference' syntax (e.g. 'reviewer:agentcatalog/review-pr'). External agents without an explicit name are named after their last path segment.",
           "items": {
             "type": "string"
           }
         },
         "handoffs": {
           "type": "array",
-          "description": "List of agents this agent can hand off the conversation to. Can be names of agents defined in this config or external references (OCI images like 'namespace/repo' or URLs).",
+          "description": "List of agents this agent can hand off the conversation to. Can be names of agents defined in this config, external references (OCI images like 'namespace/repo' or URLs), or named external references using 'name:reference' syntax (e.g. 'reviewer:agentcatalog/review-pr'). External agents without an explicit name are named after their last path segment.",
           "items": {
             "type": "string"
           }
@@ -194,6 +194,16 @@
           "type": "integer",
           "description": "Maximum number of iterations",
           "minimum": 0
+        },
+        "max_consecutive_tool_calls": {
+          "type": "integer",
+          "description": "Maximum consecutive identical tool calls before the agent is terminated. Prevents degenerate loops. 0 uses the default of 5.",
+          "minimum": 0
+        },
+        "max_old_tool_call_tokens": {
+          "type": "integer",
+          "description": "Maximum number of tokens to keep from old tool call arguments and results. Older tool calls beyond this budget will have their content replaced with a placeholder. Tokens are approximated as len/4. Set to -1 to disable truncation (unlimited tool content). Default: 40000.",
+          "minimum": -1
         },
         "num_history_items": {
           "type": "integer",
@@ -301,13 +311,6 @@
             "schema"
           ],
           "additionalProperties": false
-        },
-        "rag": {
-          "type": "array",
-          "description": "List of RAG sources to use for this agent",
-          "items": {
-            "type": "string"
-          }
         },
         "add_description_parameter": {
           "type": "boolean",
@@ -419,6 +422,20 @@
           "items": {
             "$ref": "#/definitions/HookDefinition"
           }
+        },
+        "stop": {
+          "type": "array",
+          "description": "Hooks that run when the model finishes responding and is about to hand control back to the user. Can perform post-response validation or logging.",
+          "items": {
+            "$ref": "#/definitions/HookDefinition"
+          }
+        },
+        "notification": {
+          "type": "array",
+          "description": "Hooks that run when the agent sends a notification (error, warning) to the user. Can send external notifications or log events.",
+          "items": {
+            "$ref": "#/definitions/HookDefinition"
+          }
         }
       },
       "additionalProperties": false
@@ -489,7 +506,8 @@
             "openai",
             "anthropic",
             "dmr",
-            "ollama"
+            "ollama",
+            "github-copilot"
           ]
         },
         "model": {
@@ -553,7 +571,7 @@
         },
         "provider_opts": {
           "type": "object",
-          "description": "Provider-specific options. dmr: runtime_flags. anthropic/amazon-bedrock (Claude): interleaved_thinking (boolean, default true). openai/anthropic/google: rerank_prompt (string) to fully override the system prompt used for RAG reranking (advanced - prefer using results.reranking.criteria for domain-specific guidance).",
+          "description": "Provider-specific options. Sampling parameters: top_k (integer, supported by anthropic, google, amazon-bedrock, and custom OpenAI-compatible providers like vLLM/Ollama), repetition_penalty (float, forwarded to custom OpenAI-compatible providers), min_p (float, forwarded to custom providers), seed (integer, forwarded to OpenAI). Infrastructure options: dmr: runtime_flags. anthropic/amazon-bedrock (Claude): interleaved_thinking (boolean, default true). openai: transport ('sse' or 'websocket') to choose between SSE and WebSocket streaming for the Responses API. openai/anthropic/google: rerank_prompt (string) to fully override the system prompt used for RAG reranking (advanced - prefer using results.reranking.criteria for domain-specific guidance). Google: google_search (boolean) enables Google Search grounding, google_maps (boolean) enables Google Maps grounding, code_execution (boolean) enables server-side code execution.",
           "additionalProperties": true
         },
         "track_usage": {
@@ -561,18 +579,12 @@
           "description": "Whether to track usage"
         },
         "thinking_budget": {
-          "description": "Controls reasoning effort/budget. Use 'none' or 0 to disable thinking. OpenAI: string levels ('minimal','low','medium','high'), default 'medium'. Anthropic: integer token budget (1024-32768), default 8192. Amazon Bedrock (Claude): same as Anthropic. Google Gemini 2.5: integer token budget (-1 for dynamic, 0 to disable, 24576 max), default -1. Google Gemini 3: string levels ('minimal' Flash only,'low','medium','high'), default 'high' for Pro, 'medium' for Flash.",
+          "description": "Controls reasoning effort/budget. Use 'none' or 0 to disable thinking. OpenAI: string levels ('minimal','low','medium','high','xhigh'). Anthropic: integer token budget (1024-32768), 'adaptive' (adaptive thinking with high effort by default), 'adaptive/<effort>' where effort is low/medium/high/max (adaptive thinking with specified effort), or effort levels ('low','medium','high','max') which use adaptive thinking with the given effort. Amazon Bedrock (Claude): integer token budget or effort levels ('low','medium','high') mapped to token budgets. Google Gemini 2.5: integer token budget (-1 for dynamic, 0 to disable, 24576 max). Google Gemini 3: string levels ('minimal' Flash only,'low','medium','high'). Thinking is only enabled when explicitly configured.",
           "oneOf": [
             {
               "type": "string",
-              "enum": [
-                "none",
-                "minimal",
-                "low",
-                "medium",
-                "high"
-              ],
-              "description": "Reasoning effort level (OpenAI, Gemini 3). Use 'none' to disable thinking."
+              "pattern": "^(none|minimal|low|medium|high|xhigh|max|adaptive(/low|/medium|/high|/max)?)$",
+              "description": "Reasoning effort level. 'adaptive' uses adaptive thinking with high effort (default). 'adaptive/<effort>' specifies the effort level (low/medium/high/max). Use 'none' to disable thinking."
             },
             {
               "type": "integer",
@@ -588,6 +600,13 @@
             "low",
             "medium",
             "high",
+            "xhigh",
+            "max",
+            "adaptive",
+            "adaptive/low",
+            "adaptive/medium",
+            "adaptive/high",
+            "adaptive/max",
             -1,
             1024,
             8192,
@@ -807,6 +826,51 @@
       ],
       "additionalProperties": false
     },
+    "RAGToolset": {
+      "type": "object",
+      "description": "Reusable RAG source definition. Define once at the top level and reference by name from agent toolsets. RAG config fields (tool, docs, strategies, results, respect_vcs) are specified directly alongside toolset fields.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RAGConfig"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instruction": {
+              "type": "string",
+              "description": "Custom instruction for this RAG source"
+            },
+            "tools": {
+              "type": "array",
+              "description": "Optional list of tools to expose",
+              "items": {
+                "type": "string"
+              }
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional display name override for the RAG tool"
+            },
+            "defer": {
+              "description": "Deferred loading configuration",
+              "oneOf": [
+                {
+                  "type": "boolean",
+                  "description": "Set to true to defer all tools"
+                },
+                {
+                  "type": "array",
+                  "description": "Array of tool names to defer",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
     "Toolset": {
       "type": "object",
       "description": "Tool configuration",
@@ -830,7 +894,8 @@
             "user_prompt",
             "openapi",
             "model_picker",
-            "background_agents"
+            "background_agents",
+            "rag"
           ]
         },
         "instruction": {
@@ -909,6 +974,10 @@
         "api_config": {
           "$ref": "#/definitions/ApiConfig",
           "description": "API tool configuration"
+        },
+        "rag_config": {
+          "$ref": "#/definitions/RAGConfig",
+          "description": "RAG configuration for type: rag toolsets"
         },
         "ignore_vcs": {
           "type": "boolean",
@@ -1117,6 +1186,13 @@
           "properties": {
             "type": {
               "const": "background_agents"
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "rag"
             }
           }
         }

@@ -21,7 +21,7 @@ Starting with [Docker Desktop 4.49.0](https://docs.docker.com/desktop/release-no
 $ docker agent version
 ```
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Tip
 </div>
   <p>Docker Desktop bundles docker-agent and keeps it up to date. This is the easiest way to get started, especially if you want to use Docker MCP tools and Docker Model Runner.</p>
@@ -49,8 +49,10 @@ Download [prebuilt binary releases](https://github.com/docker/docker-agent/relea
 ### macOS / Linux
 
 ```bash
-# Download the latest release (adjust URL for your platform)
-curl -L https://github.com/docker/docker-agent/releases/latest/download/docker-agent-$(uname -s)-$(uname -m) -o docker-agent
+# Download the latest release
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64;; aarch64) ARCH=arm64;; esac
+curl -L "https://github.com/docker/docker-agent/releases/latest/download/docker-agent-${OS}-${ARCH}" -o docker-agent
 chmod +x docker-agent
 sudo mv docker-agent /usr/local/bin/
 docker-agent version
@@ -63,7 +65,7 @@ docker agent version
 
 ### Windows
 
-Download `docker-agent-Windows-amd64.exe` from the [releases page](https://github.com/docker/docker-agent/releases), rename it to `docker-agent.exe` and add it to your PATH. Alternatively you can move it to `~/.docker/cli-plugins`
+Download `docker-agent-windows-amd64.exe` from the [releases page](https://github.com/docker/docker-agent/releases), rename it to `docker-agent.exe` and add it to your PATH. Alternatively you can move it to `~/.docker/cli-plugins`
 
 ## Build from Source
 
@@ -72,7 +74,7 @@ For the latest features, or to contribute, build from source:
 ### Prerequisites
 
 - [Go 1.26](https://go.dev/dl/) or higher
-- [Task 3.44](https://taskfile.dev/installation/) or higher (build tool)
+- [mise](https://mise.jdx.dev/getting-started.html) (build tool)
 - [golangci-lint](https://golangci-lint.run/docs/welcome/install/local/) (for linting)
 
 ```bash
@@ -81,16 +83,16 @@ git clone https://github.com/docker/docker-agent.git
 cd docker-agent
 
 # Build the binary
-task build
+mise build
 
 # The binary is at ./bin/docker-agent
 ./bin/docker-agent --help
 ```
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Building on Windows
 </div>
-  <p>On Windows, use <code>task build-local</code> instead of <code>task build</code>. This builds the binary inside a Docker container using Docker Buildx, which avoids issues with Windows-specific toolchain setup and CGo cross-compilation. The output goes to the <code>./dist</code> directory.</p>
+  <p>On Windows, use <code>mise build-local</code> instead of <code>mise build</code>. This builds the binary inside a Docker container using Docker Buildx, which avoids issues with Windows-specific toolchain setup and CGo cross-compilation. The output goes to the <code>./dist</code> directory.</p>
 
 </div>
 
@@ -106,7 +108,7 @@ export GOOGLE_API_KEY="AI..."           # Google Gemini
 export MISTRAL_API_KEY="..."            # Mistral
 ```
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ Note
 </div>
   <p>You only need the key(s) for the provider(s) you configure in your agent YAML. If you use Docker Model Runner (DMR), no API key is needed — models run locally.</p>

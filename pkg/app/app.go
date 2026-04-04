@@ -1,6 +1,7 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"github.com/docker/docker-agent/pkg/runtime"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/sessiontitle"
+	"github.com/docker/docker-agent/pkg/shellpath"
 	"github.com/docker/docker-agent/pkg/skills"
 	"github.com/docker/docker-agent/pkg/tools"
 	mcptools "github.com/docker/docker-agent/pkg/tools/mcp"
@@ -115,18 +117,6 @@ func New(ctx context.Context, rt runtime.Runtime, sess *session.Session, opts ..
 		}
 	}()
 
-	// If the runtime supports background RAG initialization, start it
-	// and forward events to the TUI. Remote runtimes typically handle RAG server-side
-	// and won't implement this optional interface.
-	if ragRuntime, ok := rt.(runtime.RAGInitializer); ok {
-		go ragRuntime.StartBackgroundRAGInit(ctx, func(event runtime.Event) {
-			select {
-			case app.events <- event:
-			case <-ctx.Done():
-			}
-		})
-	}
-
 	// Subscribe to tool list changes so the sidebar updates immediately
 	// when an MCP server adds or removes tools (outside of a RunStream).
 	if tcs, ok := rt.(runtime.ToolsChangeSubscriber); ok {
@@ -178,6 +168,11 @@ func (a *App) SendFirstMessage() tea.Cmd {
 	return tea.Sequence(cmds...)
 }
 
+// CurrentAgentTools returns the tools available to the current agent.
+func (a *App) CurrentAgentTools(ctx context.Context) ([]tools.Tool, error) {
+	return a.runtime.CurrentAgentTools(ctx)
+}
+
 // CurrentAgentCommands returns the commands for the active agent
 func (a *App) CurrentAgentCommands(ctx context.Context) types.Commands {
 	return a.runtime.CurrentAgentInfo(ctx).Commands
@@ -194,7 +189,7 @@ func (a *App) CurrentAgentSkills() []skills.Skill {
 
 // ResolveSkillCommand checks if the input matches a skill slash command (e.g. /skill-name args).
 // If matched, it reads the skill content and returns the resolved prompt. Otherwise returns "".
-func (a *App) ResolveSkillCommand(input string) (string, error) {
+func (a *App) ResolveSkillCommand(ctx context.Context, input string) (string, error) {
 	if !strings.HasPrefix(input, "/") {
 		return "", nil
 	}
@@ -212,7 +207,7 @@ func (a *App) ResolveSkillCommand(input string) (string, error) {
 			continue
 		}
 
-		content, err := st.ReadSkillContent(skill.Name)
+		content, err := st.ReadSkillContent(ctx, skill.Name)
 		if err != nil {
 			return "", fmt.Errorf("reading skill %q: %w", skill.Name, err)
 		}
@@ -229,7 +224,7 @@ func (a *App) ResolveSkillCommand(input string) (string, error) {
 // ResolveInput resolves the user input by trying skill commands first,
 // then agent commands. Returns the resolved content ready to send to the agent.
 func (a *App) ResolveInput(ctx context.Context, input string) string {
-	if resolved, err := a.ResolveSkillCommand(input); err != nil {
+	if resolved, err := a.ResolveSkillCommand(ctx, input); err != nil {
 		return fmt.Sprintf("Error loading skill: %v", err)
 	} else if resolved != "" {
 		return resolved
@@ -509,7 +504,8 @@ func (a *App) RunBangCommand(ctx context.Context, command string) {
 		return
 	}
 
-	out, err := exec.CommandContext(ctx, "/bin/sh", "-c", command).CombinedOutput()
+	shell, argsPrefix := shellpath.DetectShell()
+	out, err := exec.CommandContext(ctx, shell, append(argsPrefix, command)...).CombinedOutput()
 	output := "$ " + command + "\n" + string(out)
 	if err != nil && len(out) == 0 {
 		output = "$ " + command + "\nError: " + err.Error()
@@ -551,12 +547,11 @@ func (a *App) NewSession() {
 		a.cancel()
 		a.cancel = nil
 	}
-	// Preserve user-controlled session flags (like /think toggle)
+	// Preserve user-controlled session flags
 	// so they don't reset to default on /new
 	var opts []session.Opt
 	if a.session != nil {
 		opts = append(opts,
-			session.WithThinking(a.session.Thinking),
 			session.WithToolsApproved(a.session.ToolsApproved),
 			session.WithHideToolResults(a.session.HideToolResults),
 			session.WithWorkingDir(a.session.WorkingDir),
@@ -566,6 +561,30 @@ func (a *App) NewSession() {
 	// Clear first message so it won't be re-sent on re-init
 	a.firstMessage = nil
 	a.firstMessageAttach = ""
+
+	// Re-emit startup info so the sidebar shows agent/tools info in the new session
+	a.reEmitStartupInfo(context.Background())
+}
+
+// reEmitStartupInfo resets and re-emits startup info (agent, team, tools)
+// through the events channel so the sidebar updates.
+func (a *App) reEmitStartupInfo(ctx context.Context) {
+	a.runtime.ResetStartupInfo()
+	go func() {
+		startupEvents := make(chan runtime.Event, 10)
+		go func() {
+			defer close(startupEvents)
+			a.runtime.EmitStartupInfo(ctx, a.session, startupEvents)
+		}()
+		for event := range startupEvents {
+			select {
+			case a.events <- event:
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}()
 }
 
 func (a *App) Session() *session.Session {
@@ -666,21 +685,7 @@ func (a *App) SetCurrentAgentModel(ctx context.Context, modelRef string) error {
 	}
 
 	// Re-emit startup info so the sidebar updates with the new model
-	a.runtime.ResetStartupInfo()
-	go func() {
-		startupEvents := make(chan runtime.Event, 10)
-		go func() {
-			defer close(startupEvents)
-			a.runtime.EmitStartupInfo(ctx, a.session, startupEvents)
-		}()
-		for event := range startupEvents {
-			select {
-			case a.events <- event:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	a.reEmitStartupInfo(ctx)
 
 	return nil
 }
@@ -840,21 +845,7 @@ func (a *App) ReplaceSession(ctx context.Context, sess *session.Session) {
 	a.applySessionModelOverrides(ctx, sess)
 
 	// Reset and re-emit startup info so the sidebar shows agent/tools info
-	a.runtime.ResetStartupInfo()
-	go func() {
-		startupEvents := make(chan runtime.Event, 10)
-		go func() {
-			defer close(startupEvents)
-			a.runtime.EmitStartupInfo(ctx, a.session, startupEvents)
-		}()
-		for event := range startupEvents {
-			select {
-			case a.events <- event:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	a.reEmitStartupInfo(ctx)
 }
 
 // applySessionModelOverrides applies any stored model overrides from a loaded session.
@@ -997,12 +988,24 @@ func (a *App) mergeEvents(events []tea.Msg) []tea.Msg {
 			result = append(result, merged)
 
 		case *runtime.PartialToolCallEvent:
-			// For PartialToolCallEvent, keep only the latest one per tool call ID
-			// Only merge consecutive events with the same ID
+			// For PartialToolCallEvent, merge consecutive events with the same tool call ID
+			// by concatenating argument deltas
 			latest := ev
 			for i+1 < len(events) {
 				if next, ok := events[i+1].(*runtime.PartialToolCallEvent); ok && next.ToolCall.ID == ev.ToolCall.ID {
-					latest = next
+					latest = &runtime.PartialToolCallEvent{
+						Type: ev.Type,
+						ToolCall: tools.ToolCall{
+							ID:   ev.ToolCall.ID,
+							Type: ev.ToolCall.Type,
+							Function: tools.FunctionCall{
+								Name:      cmp.Or(next.ToolCall.Function.Name, latest.ToolCall.Function.Name),
+								Arguments: latest.ToolCall.Function.Arguments + next.ToolCall.Function.Arguments,
+							},
+						},
+						ToolDefinition: cmp.Or(latest.ToolDefinition, next.ToolDefinition),
+						AgentContext:   ev.AgentContext,
+					}
 					i++
 				} else {
 					break
@@ -1026,11 +1029,11 @@ func (a *App) ExportHTML(ctx context.Context, filename string) (string, error) {
 	return export.SessionToFile(a.session, agentInfo.Description, filename)
 }
 
-// UpdateSessionTitle updates the current session's title and persists it.
-// It works with both local and remote runtimes.
 // ErrTitleGenerating is returned when attempting to set a title while generation is in progress.
 var ErrTitleGenerating = errors.New("title generation in progress, please wait")
 
+// UpdateSessionTitle updates the current session's title and persists it.
+// It works with both local and remote runtimes.
 func (a *App) UpdateSessionTitle(ctx context.Context, title string) error {
 	if a.session == nil {
 		return errors.New("no active session")

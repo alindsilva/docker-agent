@@ -27,7 +27,7 @@ agents:
       - type: filesystem # required for reading skill files
 ```
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Tip
 </div>
   <p>Skills are perfect for encoding team-specific workflows (PR review, deployment, coding standards) that apply across projects.</p>
@@ -56,6 +56,53 @@ When asked to create a Dockerfile:
 3. Minimize image size by using slim base images
 4. Follow security best practices (non-root user, etc.)
 ```
+
+### Frontmatter Fields
+
+| Field            | Required | Description                                                                 |
+| ---------------- | -------- | --------------------------------------------------------------------------- |
+| `name`           | Yes      | Unique skill identifier                                                     |
+| `description`    | Yes      | Short description shown to the agent for skill matching                     |
+| `context`        | No       | Set to `fork` to run the skill as an isolated sub-agent (see below)         |
+| `allowed-tools`  | No       | List of tools the skill needs (YAML list or comma-separated string)         |
+| `license`        | No       | License identifier (e.g. `Apache-2.0`)                                      |
+| `compatibility`  | No       | Free-text compatibility notes                                               |
+| `metadata`       | No       | Arbitrary key-value pairs (e.g. `author`, `version`)                        |
+
+## Running a Skill as a Sub-Agent
+
+By default, when an agent invokes a skill it reads the instructions inline into its own conversation. For complex, multi-step skills this can consume a large portion of the agent's context window and pollute the parent conversation with intermediate tool calls.
+
+Adding `context: fork` to the SKILL.md frontmatter tells the agent to run the skill in an **isolated sub-agent** instead:
+
+<!-- yaml-lint:skip -->
+```yaml
+---
+name: bump-go-dependencies
+description: Update Go module dependencies one by one
+context: fork
+---
+
+# Bump Dependencies
+
+1. List outdated deps
+2. Update each one, run tests, commit or revert
+3. Produce a summary table
+```
+
+When the agent encounters a task that matches a `context: fork` skill, it uses the `run_skill` tool instead of `read_skill`. This:
+
+- **Spawns a child session** with the skill content as the system prompt and the caller's task as the user message
+- **Isolates the context window** — the sub-agent has its own conversation history, so lengthy tool-call chains don't eat into the parent's token budget
+- **Folds the result** — only the sub-agent's final answer is returned to the parent as the tool result
+- **Inherits the parent's model and tools** — the sub-agent can use all tools available to the parent agent
+
+<div class="callout callout-tip" markdown="1">
+<div class="callout-title">💡 When to use context: fork
+</div>
+  <p>Use <code>context: fork</code> for skills that involve many steps, heavy tool usage, or that should not clutter the main conversation — for example dependency bumping, large refactors, or code generation pipelines.</p>
+
+</div>
 
 ## Search Paths
 
@@ -126,7 +173,7 @@ EOF
 
 The skill will automatically be available to any agent with `skills: true`.
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ See also
 </div>
   <p>Skills are enabled in the <a href="{{ '/configuration/agents/' | relative_url }}">Agent Config</a> with the <code>skills: true</code> property. For tool-based capabilities, see <a href="{{ '/concepts/tools/' | relative_url }}">Tools</a>.</p>

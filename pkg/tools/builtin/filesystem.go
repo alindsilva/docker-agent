@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/fsx"
+	"github.com/docker/docker-agent/pkg/shellpath"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -50,6 +52,9 @@ var (
 	_ tools.ToolSet      = (*FilesystemTool)(nil)
 	_ tools.Instructable = (*FilesystemTool)(nil)
 )
+
+// allowAllPaths is a no-op path filter that permits every path.
+func allowAllPaths(_ string) error { return nil }
 
 type FileSystemOpt func(*FilesystemTool)
 
@@ -159,6 +164,42 @@ type Edit struct {
 type EditFileArgs struct {
 	Path  string `json:"path" jsonschema:"The file path to edit"`
 	Edits []Edit `json:"edits" jsonschema:"Array of edit operations"`
+}
+
+// UnmarshalJSON handles LLM-generated arguments where "edits" may be
+// a JSON string instead of a JSON array (double-serialized).
+func (a *EditFileArgs) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Path  string          `json:"path"`
+		Edits json.RawMessage `json:"edits"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("failed to parse edit_file arguments: %w", err)
+	}
+
+	a.Path = raw.Path
+
+	// When edits is missing or null (e.g. during argument streaming in
+	// the TUI, or partial tool calls), accept the partial result.
+	if len(raw.Edits) == 0 || string(raw.Edits) == "null" {
+		return nil
+	}
+
+	// Try parsing edits as an array first (normal case).
+	if err := json.Unmarshal(raw.Edits, &a.Edits); err == nil {
+		return nil
+	}
+
+	// Try unwrapping a double-serialized JSON string.
+	var editsStr string
+	if err := json.Unmarshal(raw.Edits, &editsStr); err != nil {
+		return fmt.Errorf("edits field is neither an array nor a JSON string: %w", err)
+	}
+	if err := json.Unmarshal([]byte(editsStr), &a.Edits); err != nil {
+		return fmt.Errorf("failed to parse double-serialized edits string: %w", err)
+	}
+
+	return nil
 }
 
 func (t *FilesystemTool) Tools(context.Context) ([]tools.Tool, error) {
@@ -314,9 +355,10 @@ func (t *FilesystemTool) executePostEditCommands(ctx context.Context, filePath s
 			continue
 		}
 
-		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", postEdit.Cmd)
+		shell, argsPrefix := shellpath.DetectShell()
+		cmd := exec.CommandContext(ctx, shell, append(argsPrefix, postEdit.Cmd)...)
 		cmd.Env = cmd.Environ()
-		cmd.Env = append(cmd.Env, "path="+filePath)
+		cmd.Env = append(cmd.Env, "file="+filePath)
 
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("post-edit command failed for %s: %w", filePath, err)
@@ -375,23 +417,15 @@ func (t *FilesystemTool) shouldIgnorePath(path string) bool {
 	// Lazily initialize the gitignore matcher on first use
 	t.initGitignoreMatcher()
 
-	if t.repoMatcher != nil && t.repoMatcher.ShouldIgnore(path) {
-		return true
-	}
-
-	return false
+	return t.repoMatcher != nil && t.repoMatcher.ShouldIgnore(path)
 }
 
 // Handler implementations
 
-func (t *FilesystemTool) handleDirectoryTree(_ context.Context, args DirectoryTreeArgs) (*tools.ToolCallResult, error) {
+func (t *FilesystemTool) handleDirectoryTree(ctx context.Context, args DirectoryTreeArgs) (*tools.ToolCallResult, error) {
 	resolvedPath := t.resolvePath(args.Path)
 
-	isPathAllowed := func(_ string) error {
-		return nil
-	}
-
-	tree, err := fsx.DirectoryTree(resolvedPath, isPathAllowed, t.shouldIgnorePath, maxFiles)
+	tree, err := fsx.DirectoryTree(ctx, resolvedPath, allowAllPaths, t.shouldIgnorePath, maxFiles)
 	if err != nil {
 		return tools.ResultError(fmt.Sprintf("Error building directory tree: %s", err)), nil
 	}
@@ -512,7 +546,7 @@ func (t *FilesystemTool) handleReadFile(_ context.Context, args ReadFileArgs) (*
 	info, err := os.Stat(resolvedPath)
 	if err != nil {
 		var errMsg string
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			errMsg = "not found"
 		} else {
 			errMsg = err.Error()
@@ -543,24 +577,22 @@ func (t *FilesystemTool) handleReadFile(_ context.Context, args ReadFileArgs) (*
 		}, nil
 	}
 
+	text := string(content)
+
 	return &tools.ToolCallResult{
-		Output: string(content),
+		Output: text,
 		Meta: ReadFileMeta{
-			LineCount: strings.Count(string(content), "\n") + 1,
+			LineCount: strings.Count(text, "\n") + 1,
 		},
 	}, nil
 }
 
 // readImageFile reads an image file and returns it as base64-encoded image content.
+// The caller must ensure the file exists (e.g. via os.Stat) before calling this method.
 func (t *FilesystemTool) readImageFile(resolvedPath, originalPath string) (*tools.ToolCallResult, error) {
 	data, err := os.ReadFile(resolvedPath)
 	if err != nil {
-		var errMsg string
-		if os.IsNotExist(err) {
-			errMsg = "not found"
-		} else {
-			errMsg = err.Error()
-		}
+		errMsg := err.Error()
 		return &tools.ToolCallResult{
 			Output:  errMsg,
 			IsError: true,
@@ -627,7 +659,7 @@ func (t *FilesystemTool) handleReadMultipleFiles(ctx context.Context, args ReadM
 		content, err := os.ReadFile(resolvedPath)
 		if err != nil {
 			errMsg := err.Error()
-			if os.IsNotExist(err) {
+			if errors.Is(err, fs.ErrNotExist) {
 				errMsg = "not found"
 			}
 			contents = append(contents, PathContent{
@@ -639,12 +671,13 @@ func (t *FilesystemTool) handleReadMultipleFiles(ctx context.Context, args ReadM
 			continue
 		}
 
+		text := string(content)
 		contents = append(contents, PathContent{
 			Path:    path,
-			Content: string(content),
+			Content: text,
 		})
-		entry.Content = string(content)
-		entry.LineCount = strings.Count(string(content), "\n") + 1
+		entry.Content = text
+		entry.LineCount = strings.Count(text, "\n") + 1
 		meta.Files = append(meta.Files, entry)
 	}
 

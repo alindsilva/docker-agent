@@ -12,6 +12,7 @@ import (
 
 type toolSet struct {
 	tools.ToolSet
+
 	instruction string
 }
 

@@ -95,7 +95,6 @@ type Page interface {
 	layout.Sizeable
 	layout.Help
 	CompactSession(additionalPrompt string) tea.Cmd
-	Cleanup()
 	// SetSessionStarred updates the sidebar star indicator
 	SetSessionStarred(starred bool)
 	// SetTitleRegenerating sets the title regenerating state on the sidebar
@@ -140,7 +139,8 @@ type chatPage struct {
 	sessionState *service.SessionState
 
 	// State
-	working bool
+	working  bool
+	leanMode bool
 
 	msgCancel       context.CancelFunc
 	streamCancelled bool
@@ -174,6 +174,16 @@ type chatPage struct {
 // computeSidebarLayout calculates the layout based on current state.
 func (p *chatPage) computeSidebarLayout() sidebarLayout {
 	innerWidth := p.width - appPaddingHorizontal
+
+	// Lean mode: no sidebar at all
+	if p.leanMode {
+		return sidebarLayout{
+			mode:       sidebarCollapsedNarrow,
+			innerWidth: innerWidth,
+			chatWidth:  innerWidth,
+			chatHeight: max(1, p.height),
+		}
+	}
 
 	var mode sidebarLayoutMode
 	switch {
@@ -301,7 +311,7 @@ func getEditorDisplayNameFromEnv(visual, editorEnv string) string {
 }
 
 // New creates a new chat page
-func New(a *app.App, sessionState *service.SessionState) Page {
+func New(a *app.App, sessionState *service.SessionState, opts ...PageOption) Page {
 	p := &chatPage{
 		sidebar:      sidebar.New(sessionState),
 		messages:     messages.New(sessionState),
@@ -310,7 +320,21 @@ func New(a *app.App, sessionState *service.SessionState) Page {
 		sessionState: sessionState,
 	}
 
+	for _, opt := range opts {
+		opt(p)
+	}
+
 	return p
+}
+
+// PageOption configures a chat page.
+type PageOption func(*chatPage)
+
+// WithLeanMode creates a lean chat page with no sidebar.
+func WithLeanMode() PageOption {
+	return func(p *chatPage) {
+		p.leanMode = true
+	}
 }
 
 // Init initializes the chat page
@@ -519,19 +543,26 @@ func (p *chatPage) View() string {
 		bodyContent = lipgloss.JoinHorizontal(lipgloss.Left, chatView, toggleCol, sidebarView)
 
 	case sidebarCollapsed, sidebarCollapsedNarrow:
-		sidebarRendered := p.renderCollapsedSidebar(sl)
-
-		chatView := styles.ChatStyle.
-			Height(sl.chatHeight).
-			Width(sl.innerWidth).
-			Render(messagesView)
-
-		bodyContent = lipgloss.JoinVertical(lipgloss.Top, sidebarRendered, chatView)
+		if p.leanMode {
+			// Lean mode: no sidebar header, no fixed height
+			bodyContent = styles.ChatStyle.
+				Width(sl.innerWidth).
+				Render(messagesView)
+		} else {
+			sidebarRendered := p.renderCollapsedSidebar(sl)
+			chatView := styles.ChatStyle.
+				Height(sl.chatHeight).
+				Width(sl.innerWidth).
+				Render(messagesView)
+			bodyContent = lipgloss.JoinVertical(lipgloss.Top, sidebarRendered, chatView)
+		}
 	}
 
-	return styles.AppStyle.
-		Height(p.height).
-		Render(bodyContent)
+	appStyle := styles.AppStyle
+	if !p.leanMode {
+		appStyle = appStyle.Height(p.height)
+	}
+	return appStyle.Render(bodyContent)
 }
 
 // renderSidebarHandle renders the sidebar toggle/resize handle.
@@ -624,6 +655,13 @@ func (p *chatPage) cancelStream(showCancelMessage bool) tea.Cmd {
 // handleSendMsg handles incoming messages from the editor, either processing
 // them immediately or queuing them if the agent is busy.
 func (p *chatPage) handleSendMsg(msg msgtypes.SendMsg) (layout.Model, tea.Cmd) {
+	// Handle "exit", "quit", and ":q" as special keywords to quit the session
+	// immediately, equivalent to the /exit slash command.
+	switch strings.TrimSpace(msg.Content) {
+	case "exit", "quit", ":q":
+		return p, core.CmdHandler(msgtypes.ExitSessionMsg{})
+	}
+
 	// Predefined slash commands (e.g., /yolo, /exit, /compact) execute immediately
 	// even while the agent is working - they're UI commands that don't interrupt the stream.
 	// Custom agent commands (defined in config) should still be queued.
@@ -890,10 +928,6 @@ func (p *chatPage) CompactSession(additionalPrompt string) tea.Cmd {
 		p.setPendingResponse(true),
 		p.messages.ScrollToBottom(),
 	)
-}
-
-func (p *chatPage) Cleanup() {
-	p.sidebar.Cleanup()
 }
 
 // SetSessionStarred updates the sidebar star indicator

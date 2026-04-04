@@ -12,7 +12,7 @@ _Package, share, and run agents via OCI-compatible registries — just like cont
 
 docker-agent agents can be pushed to any OCI-compatible registry (Docker Hub, GitHub Container Registry, etc.) and pulled/run anywhere. This makes sharing agents as easy as sharing Docker images.
 
-<div class="callout callout-tip">
+<div class="callout callout-tip" markdown="1">
 <div class="callout-title">💡 Tip
 </div>
   <p>For CLI commands related to distribution, see <a href="{{ '/features/cli/' | relative_url }}">CLI Reference</a> (<code>docker agent share push</code>, <code>docker agent share pull</code>, <code>docker agent alias</code>).</p>
@@ -66,6 +66,25 @@ $ docker agent run agentcatalog/pirate
 $ docker agent run agentcatalog/coder
 ```
 
+## Using as Sub-Agents
+
+Registry agents can be used directly as sub-agents in a multi-agent configuration — no need to define them locally:
+
+```yaml
+agents:
+  root:
+    model: openai/gpt-4o
+    description: Coordinator
+    instruction: Delegate tasks to the right sub-agent.
+    sub_agents:
+      - agentcatalog/pirate         # auto-named "pirate"
+      - my_reviewer:myorg/reviewer  # explicitly named "my_reviewer"
+```
+
+External sub-agents are automatically named after their last path segment. Use the `name:reference` syntax to give them a custom name.
+
+See [External Sub-Agents]({{ '/concepts/multi-agent/#external-sub-agents-from-registries' | relative_url }}) for details.
+
 ## Using with Aliases
 
 Combine OCI references with aliases for convenient access:
@@ -100,7 +119,7 @@ $ docker agent share push ./agent.yaml docker.io/myorg/private-agent:latest
 $ docker agent run docker.io/myorg/private-agent:latest
 ```
 
-<div class="callout callout-info">
+<div class="callout callout-info" markdown="1">
 <div class="callout-title">ℹ️ Troubleshooting
 </div>
   <p>Having issues with push/pull? See <a href="{{ '/community/troubleshooting/' | relative_url }}">Troubleshooting</a> for common registry issues.</p>
