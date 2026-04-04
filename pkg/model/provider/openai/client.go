@@ -54,6 +54,10 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		opt(&globalOptions)
 	}
 
+	// expandedBaseURL holds the base URL with ${...} placeholders resolved.
+	// It is used both for the HTTP client option and the WebSocket pool.
+	var expandedBaseURL string
+
 	var clientFn func(context.Context) (*openai.Client, error)
 	if gateway := globalOptions.Gateway(); gateway == "" {
 		var clientOptions []option.RequestOption
@@ -89,7 +93,8 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		if cfg.Provider == "azure" {
 			// Azure configuration
 			if cfg.BaseURL != "" {
-				expandedBaseURL, err := environment.Expand(ctx, cfg.BaseURL, env)
+				var err error
+				expandedBaseURL, err = environment.Expand(ctx, cfg.BaseURL, env)
 				if err != nil {
 					return nil, fmt.Errorf("expanding base_url: %w", err)
 				}
@@ -106,7 +111,8 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 				}
 			}
 		} else if cfg.BaseURL != "" {
-			expandedBaseURL, err := environment.Expand(ctx, cfg.BaseURL, env)
+			var err error
+			expandedBaseURL, err = environment.Expand(ctx, cfg.BaseURL, env)
 			if err != nil {
 				return nil, fmt.Errorf("expanding base_url: %w", err)
 			}
@@ -231,8 +237,8 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	// The pool is cheap (no connections opened until the first Stream call)
 	// and eager init avoids a data race on the lazy path.
 	if getTransport(cfg) == "websocket" && globalOptions.Gateway() == "" {
-		baseURL := cmp.Or(cfg.BaseURL, "https://api.openai.com/v1")
-		client.wsPool = newWSPool(httpToWSURL(baseURL), client.buildWSHeaderFn())
+		wsBaseURL := cmp.Or(expandedBaseURL, "https://api.openai.com/v1")
+		client.wsPool = newWSPool(httpToWSURL(wsBaseURL), client.buildWSHeaderFn())
 	}
 
 	return client, nil
