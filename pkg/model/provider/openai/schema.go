@@ -224,20 +224,20 @@ func normalizeUnionTypes(schema shared.FunctionParameters) shared.FunctionParame
 	// This is needed for Gemini via Cloudflare which doesn't support anyOf in tool parameters.
 	if anyOf, ok := schema["anyOf"].([]any); ok && len(anyOf) == 2 {
 		hasNull := false
-		var nonNullType string
+		var nonNullSchema map[string]any
 		for _, item := range anyOf {
 			if itemMap, ok := item.(map[string]any); ok {
 				if typStr, ok := itemMap["type"].(string); ok {
 					if typStr == "null" {
 						hasNull = true
 					} else {
-						nonNullType = typStr
+						nonNullSchema = itemMap
 					}
 				}
 			}
 		}
-		if hasNull && nonNullType != "" {
-			schema["type"] = nonNullType
+		if hasNull && nonNullSchema != nil {
+			maps.Copy(schema, nonNullSchema)
 			delete(schema, "anyOf")
 		}
 	}
