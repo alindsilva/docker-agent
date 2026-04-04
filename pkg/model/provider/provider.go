@@ -328,10 +328,6 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 				enhancedCfg.ProviderOpts["headers"] = headersCopy
 			}
 		}
-
-		// Merge model-level headers into provider_opts headers (model-level takes precedence)
-		if len(enhancedCfg.Headers) > 0 {
-			existing, _ := enhancedCfg.ProviderOpts["headers"].(map[string]string)
 			if existing == nil {
 				existing = make(map[string]string)
 			}

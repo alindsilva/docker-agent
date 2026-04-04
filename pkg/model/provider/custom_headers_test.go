@@ -86,11 +86,9 @@ func TestApplyProviderDefaults_WithHeaders(t *testing.T) {
 				headerMap, ok := headers.(map[string]string)
 				require.True(t, ok, "headers should be map[string]string")
 				assert.Equal(t, tt.expectedHeaders, headerMap, "headers should match")
-			} else {
-				if result.ProviderOpts != nil {
-					_, hasHeaders := result.ProviderOpts["headers"]
-					assert.False(t, hasHeaders, "headers should not be in ProviderOpts")
-				}
+			} else if result.ProviderOpts != nil {
+				_, hasHeaders := result.ProviderOpts["headers"]
+				assert.False(t, hasHeaders, "headers should not be in ProviderOpts")
 			}
 		})
 	}
