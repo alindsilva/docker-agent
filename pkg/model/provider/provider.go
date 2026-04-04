@@ -341,8 +341,8 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 
 		applyModelDefaults(enhancedCfg)
 		return enhancedCfg
+		}
 	}
-}
 
 	if alias, exists := Aliases[cfg.Provider]; exists {
 		// Set default base URL if not already specified
