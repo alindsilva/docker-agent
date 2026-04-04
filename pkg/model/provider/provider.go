@@ -348,12 +348,12 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 		if enhancedCfg.ProviderOpts == nil {
 			enhancedCfg.ProviderOpts = make(map[string]any)
 		}
-		existing, _ := enhancedCfg.ProviderOpts["headers"].(map[string]string)
-		if existing == nil {
-			existing = make(map[string]string)
+		mergedHeaders := make(map[string]string)
+		if existing, ok := enhancedCfg.ProviderOpts["headers"].(map[string]string); ok && existing != nil {
+			maps.Copy(mergedHeaders, existing)
 		}
-		maps.Copy(existing, enhancedCfg.Headers)
-		enhancedCfg.ProviderOpts["headers"] = existing
+		maps.Copy(mergedHeaders, enhancedCfg.Headers)
+		enhancedCfg.ProviderOpts["headers"] = mergedHeaders
 	}
 
 	// Apply model-specific defaults (e.g., thinking budget for Claude/GPT models)
