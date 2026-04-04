@@ -1,8 +1,10 @@
 {
 	"name": "cagent (Go)",
-	"image": "mcr.microsoft.com/devcontainers/go:2-1.25-bookworm",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
 	"features": {
-		"ghcr.io/eitsupi/devcontainer-features/go-task:1": {},
+		"ghcr.io/devcontainers-extra/features/mise:1": {},
 		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
 	}
 }
