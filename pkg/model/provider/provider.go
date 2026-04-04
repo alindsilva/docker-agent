@@ -341,6 +341,13 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 
 		applyModelDefaults(enhancedCfg)
 		return enhancedCfg
+	}
+}
+
+	if alias, exists := Aliases[cfg.Provider]; exists {
+		// Set default base URL if not already specified
+		if enhancedCfg.BaseURL == "" && alias.BaseURL != "" {
+			enhancedCfg.BaseURL = alias.BaseURL
 		}
 
 		// Set default token key if not already specified
