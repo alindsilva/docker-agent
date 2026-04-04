@@ -74,10 +74,9 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			// Not a custom provider - use default OpenAI behavior (OPENAI_API_KEY from env)
 			// The OpenAI SDK will automatically look for OPENAI_API_KEY if no key is set
 		default:
-			// Custom provider without token_key - prevent SDK from using OPENAI_API_KEY env var
-			// We need to explicitly set the API key to prevent the SDK from reading OPENAI_API_KEY
-			// but we don't want to send an Authorization header. The SDK doesn't send the header
-			// if we use option.WithAPIKey with a specific marker value and then remove it via middleware.
+			// Custom provider without token_key - prevent any auth header from being sent.
+			// Use middleware to strip the Authorization header, since the OpenAI SDK may
+			// still inject one from the OPENAI_API_KEY environment variable.
 			slog.Debug("Custom provider with no token_key, disabling OpenAI SDK authentication",
 				"provider", cfg.Provider, "base_url", cfg.BaseURL)
 
@@ -545,6 +544,9 @@ func (c *Client) createWebSocketStream(
 
 // buildWSHeaderFn returns a function that produces the HTTP headers needed
 // for the WebSocket handshake, including the Authorization header.
+// The auth logic mirrors the HTTP client path: explicit token_key is used when
+// set; for non-custom providers the standard OPENAI_API_KEY is used as fallback;
+// custom providers without token_key send no Authorization header.
 func (c *Client) buildWSHeaderFn() func(ctx context.Context) (http.Header, error) {
 	return func(ctx context.Context) (http.Header, error) {
 		h := http.Header{}
@@ -553,13 +555,11 @@ func (c *Client) buildWSHeaderFn() func(ctx context.Context) (http.Header, error
 		var apiKey string
 		if c.ModelConfig.TokenKey != "" {
 			apiKey, _ = c.Env.Get(ctx, c.ModelConfig.TokenKey)
-		}
-		if apiKey == "" {
-			// Fall back to the standard OPENAI_API_KEY env var via the
-			// environment provider so that secret resolution is
-			// consistent with the HTTP client path.
+		} else if !isCustomProvider(&c.ModelConfig) {
+			// Non-custom providers fall back to the standard OPENAI_API_KEY env var.
 			apiKey, _ = c.Env.Get(ctx, "OPENAI_API_KEY")
 		}
+		// Custom providers without token_key send no Authorization header (apiKey stays "").
 		if apiKey != "" {
 			h.Set("Authorization", "Bearer "+apiKey)
 		}
