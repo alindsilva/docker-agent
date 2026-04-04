@@ -319,24 +319,15 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 				enhancedCfg.ProviderOpts["api_type"] = apiType
 			}
 
-		// Copy custom headers from provider config if not already set in provider_opts
-		// Deep-copy the map to avoid mutating the shared provider config
-		if _, hasHeaders := enhancedCfg.ProviderOpts["headers"]; !hasHeaders {
-			if len(providerCfg.Headers) > 0 {
-				headersCopy := make(map[string]string, len(providerCfg.Headers))
-				maps.Copy(headersCopy, providerCfg.Headers)
-				enhancedCfg.ProviderOpts["headers"] = headersCopy
+			// Copy custom headers from provider config if not already set in provider_opts
+			// Deep-copy the map to avoid mutating the shared provider config
+			if _, hasHeaders := enhancedCfg.ProviderOpts["headers"]; !hasHeaders {
+				if len(providerCfg.Headers) > 0 {
+					headersCopy := make(map[string]string, len(providerCfg.Headers))
+					maps.Copy(headersCopy, providerCfg.Headers)
+					enhancedCfg.ProviderOpts["headers"] = headersCopy
+				}
 			}
-		}
-			if existing == nil {
-				existing = make(map[string]string)
-			}
-			maps.Copy(existing, enhancedCfg.Headers)
-			enhancedCfg.ProviderOpts["headers"] = existing
-		}
-
-		applyModelDefaults(enhancedCfg)
-		return enhancedCfg
 		}
 	}
 
