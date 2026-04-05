@@ -10,7 +10,7 @@ providers:
   # Example: Cloudflare AI Gateway with custom headers
   cloudflare_gateway:
     api_type: openai_chatcompletions
-    base_url: https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat
+    base_url: https://gateway.ai.cloudflare.com/v1/${CLOUDFLARE_ACCOUNT_ID}/${CLOUDFLARE_GATEWAY_ID}/compat
     token_key: GOOGLE_API_KEY  # Standard Authorization header for provider auth
     headers:
       # Custom header for gateway authentication with environment variable expansion
