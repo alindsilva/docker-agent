@@ -54,29 +54,50 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		opt(&globalOptions)
 	}
 
+	// expandedBaseURL holds the base URL with ${...} placeholders resolved.
+	// It is used both for the HTTP client option and the WebSocket pool.
+	var expandedBaseURL string
+
 	var clientFn func(context.Context) (*openai.Client, error)
 	if gateway := globalOptions.Gateway(); gateway == "" {
 		var clientOptions []option.RequestOption
 
-		if cfg.TokenKey != "" {
+		switch {
+		case cfg.TokenKey != "":
 			// Explicit token_key configured - use that env var
 			authToken, _ := env.Get(ctx, cfg.TokenKey)
 			if authToken == "" {
 				return nil, fmt.Errorf("%s environment variable is required", cfg.TokenKey)
 			}
 			clientOptions = append(clientOptions, option.WithAPIKey(authToken))
-		} else if isCustomProvider(cfg) {
-			// Custom provider (has api_type in ProviderOpts) without token_key - no auth
-			slog.Debug("Custom provider with no token_key, sending requests without authentication",
+		case !isCustomProvider(cfg):
+			// Not a custom provider - use default OpenAI behavior (OPENAI_API_KEY from env)
+			// The OpenAI SDK will automatically look for OPENAI_API_KEY if no key is set
+		default:
+			// Custom provider without token_key - prevent any auth header from being sent.
+			// Use middleware to strip the Authorization header, since the OpenAI SDK may
+			// still inject one from the OPENAI_API_KEY environment variable.
+			slog.Debug("Custom provider with no token_key, disabling OpenAI SDK authentication",
 				"provider", cfg.Provider, "base_url", cfg.BaseURL)
-			clientOptions = append(clientOptions, option.WithAPIKey(""))
+
+			// Use a custom HTTP client that removes the Authorization header
+			clientOptions = append(clientOptions, option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+				// Remove Authorization header for custom providers without token_key
+				req.Header.Del("Authorization")
+				return next(req)
+			}))
 		}
 		// Otherwise let the OpenAI SDK use its default behavior (OPENAI_API_KEY from env)
 
 		if cfg.Provider == "azure" {
 			// Azure configuration
 			if cfg.BaseURL != "" {
-				clientOptions = append(clientOptions, option.WithBaseURL(cfg.BaseURL))
+				var err error
+				expandedBaseURL, err = environment.Expand(ctx, cfg.BaseURL, env)
+				if err != nil {
+					return nil, fmt.Errorf("expanding base_url: %w", err)
+				}
+				clientOptions = append(clientOptions, option.WithBaseURL(expandedBaseURL))
 			}
 
 			// Azure API version from provider opts
@@ -89,7 +110,64 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 				}
 			}
 		} else if cfg.BaseURL != "" {
-			clientOptions = append(clientOptions, option.WithBaseURL(cfg.BaseURL))
+			var err error
+			expandedBaseURL, err = environment.Expand(ctx, cfg.BaseURL, env)
+			if err != nil {
+				return nil, fmt.Errorf("expanding base_url: %w", err)
+			}
+			clientOptions = append(clientOptions, option.WithBaseURL(expandedBaseURL))
+		}
+
+		// Apply custom headers from provider config if present
+		if cfg.ProviderOpts != nil {
+			if headers, exists := cfg.ProviderOpts["headers"]; exists {
+				// Handle both map[string]string and map[interface{}]interface{} from YAML parsing
+				headersMap := make(map[string]string)
+
+				switch h := headers.(type) {
+				case map[string]string:
+					// Direct map[string]string - use as-is
+					headersMap = h
+				case map[interface{}]interface{}:
+					// YAML parsed as map[interface{}]interface{} - convert
+					for k, v := range h {
+						keyStr, okKey := k.(string)
+						valStr, okVal := v.(string)
+						if !okKey || !okVal {
+							slog.Error("Invalid header key/value type",
+								"key_type", fmt.Sprintf("%T", k),
+								"value_type", fmt.Sprintf("%T", v),
+								"provider", cfg.Provider)
+							return nil, fmt.Errorf("invalid header key/value type: key=%T, value=%T", k, v)
+						}
+						headersMap[keyStr] = valStr
+					}
+				default:
+					slog.Error("Invalid headers configuration - expected map[string]string or map[interface{}]interface{}",
+						"type", fmt.Sprintf("%T", headers),
+						"provider", cfg.Provider)
+					return nil, fmt.Errorf("invalid headers configuration: expected map[string]string, got %T", headers)
+				}
+
+				if len(headersMap) > 0 {
+					slog.Debug("Applying custom headers", "count", len(headersMap), "provider", cfg.Provider)
+					for key, value := range headersMap {
+						// Expand environment variables in header values (e.g., ${VAR_NAME})
+						expandedValue, err := environment.Expand(ctx, value, env)
+						if err != nil {
+							slog.Error("Failed to expand environment variable in header",
+								"header", key,
+								"error", err,
+								"provider", cfg.Provider)
+							return nil, fmt.Errorf("expanding header %s: %w", key, err)
+						}
+						clientOptions = append(clientOptions, option.WithHeader(key, expandedValue))
+						slog.Debug("Applied custom header",
+							"header", key,
+							"provider", cfg.Provider)
+					}
+				}
+			}
 		}
 
 		httpClient := httpclient.NewHTTPClient(ctx)
@@ -158,8 +236,8 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	// The pool is cheap (no connections opened until the first Stream call)
 	// and eager init avoids a data race on the lazy path.
 	if getTransport(cfg) == "websocket" && globalOptions.Gateway() == "" {
-		baseURL := cmp.Or(cfg.BaseURL, "https://api.openai.com/v1")
-		client.wsPool = newWSPool(httpToWSURL(baseURL), client.buildWSHeaderFn())
+		wsBaseURL := cmp.Or(expandedBaseURL, "https://api.openai.com/v1")
+		client.wsPool = newWSPool(httpToWSURL(wsBaseURL), client.buildWSHeaderFn())
 	}
 
 	return client, nil
@@ -466,6 +544,9 @@ func (c *Client) createWebSocketStream(
 
 // buildWSHeaderFn returns a function that produces the HTTP headers needed
 // for the WebSocket handshake, including the Authorization header.
+// The auth logic mirrors the HTTP client path: explicit token_key is used when
+// set; for non-custom providers the standard OPENAI_API_KEY is used as fallback;
+// custom providers without token_key send no Authorization header.
 func (c *Client) buildWSHeaderFn() func(ctx context.Context) (http.Header, error) {
 	return func(ctx context.Context) (http.Header, error) {
 		h := http.Header{}
@@ -474,13 +555,11 @@ func (c *Client) buildWSHeaderFn() func(ctx context.Context) (http.Header, error
 		var apiKey string
 		if c.ModelConfig.TokenKey != "" {
 			apiKey, _ = c.Env.Get(ctx, c.ModelConfig.TokenKey)
-		}
-		if apiKey == "" {
-			// Fall back to the standard OPENAI_API_KEY env var via the
-			// environment provider so that secret resolution is
-			// consistent with the HTTP client path.
+		} else if !isCustomProvider(&c.ModelConfig) {
+			// Non-custom providers fall back to the standard OPENAI_API_KEY env var.
 			apiKey, _ = c.Env.Get(ctx, "OPENAI_API_KEY")
 		}
+		// Custom providers without token_key send no Authorization header (apiKey stays "").
 		if apiKey != "" {
 			h.Set("Authorization", "Bearer "+apiKey)
 		}

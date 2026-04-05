@@ -319,8 +319,15 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 				enhancedCfg.ProviderOpts["api_type"] = apiType
 			}
 
-			applyModelDefaults(enhancedCfg)
-			return enhancedCfg
+			// Copy custom headers from provider config if not already set in provider_opts
+			// Deep-copy the map to avoid mutating the shared provider config
+			if _, hasHeaders := enhancedCfg.ProviderOpts["headers"]; !hasHeaders {
+				if len(providerCfg.Headers) > 0 {
+					headersCopy := make(map[string]string, len(providerCfg.Headers))
+					maps.Copy(headersCopy, providerCfg.Headers)
+					enhancedCfg.ProviderOpts["headers"] = headersCopy
+				}
+			}
 		}
 	}
 
@@ -334,6 +341,19 @@ func applyProviderDefaults(cfg *latest.ModelConfig, customProviders map[string]l
 		if enhancedCfg.TokenKey == "" && alias.TokenEnvVar != "" {
 			enhancedCfg.TokenKey = alias.TokenEnvVar
 		}
+	}
+
+	// Merge model-level headers into provider_opts for non-custom providers too
+	if len(enhancedCfg.Headers) > 0 {
+		if enhancedCfg.ProviderOpts == nil {
+			enhancedCfg.ProviderOpts = make(map[string]any)
+		}
+		mergedHeaders := make(map[string]string)
+		if existing, ok := enhancedCfg.ProviderOpts["headers"].(map[string]string); ok && existing != nil {
+			maps.Copy(mergedHeaders, existing)
+		}
+		maps.Copy(mergedHeaders, enhancedCfg.Headers)
+		enhancedCfg.ProviderOpts["headers"] = mergedHeaders
 	}
 
 	// Apply model-specific defaults (e.g., thinking budget for Claude/GPT models)
